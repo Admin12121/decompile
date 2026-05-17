@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  decompile <binary> [output-dir]
+  ghidra-dump <binary> [output-dir]
+  ghidra-dump decompile <binary> [output-dir]
+  code decompile <binary> [output-dir]
+
+Environment:
+  GHIDRA_ANALYZE_HEADLESS  Path to analyzeHeadless if it is not under /usr/share/ghidra
+  GHIDRA_SCRIPT_PATH      Directory containing DumpAllDecompile.java (default: /scripts)
+  GHIDRA_TIMEOUT          Per-function decompiler timeout in seconds (default: 120)
+EOF
+}
+
+die() {
+  echo "[-] $*" >&2
+  exit 1
+}
+
+find_analyze_headless() {
+  if [[ -n "${GHIDRA_ANALYZE_HEADLESS:-}" ]]; then
+    [[ -x "$GHIDRA_ANALYZE_HEADLESS" ]] || die "GHIDRA_ANALYZE_HEADLESS is not executable: $GHIDRA_ANALYZE_HEADLESS"
+    printf '%s\n' "$GHIDRA_ANALYZE_HEADLESS"
+    return
+  fi
+
+  local candidate
+  candidate="$(find /usr/share/ghidra /opt -name analyzeHeadless -type f -executable -print -quit 2>/dev/null || true)"
+  [[ -n "$candidate" ]] || die "analyzeHeadless not found. Set GHIDRA_ANALYZE_HEADLESS."
+  printf '%s\n' "$candidate"
+}
+
+sanitize_name() {
+  local name="$1"
+  name="${name##*/}"
+  name="${name//[^A-Za-z0-9._-]/_}"
+  printf '%s\n' "${name:-binary}"
+}
+
+script_source="${BASH_SOURCE[0]}"
+while [[ -L "$script_source" ]]; do
+  script_dir="$(cd "$(dirname "$script_source")" && pwd)"
+  script_source="$(readlink "$script_source")"
+  [[ "$script_source" != /* ]] && script_source="$script_dir/$script_source"
+done
+
+cmd="${1:-}"
+if [[ "$cmd" == "-h" || "$cmd" == "--help" || -z "$cmd" ]]; then
+  usage
+  [[ -n "$cmd" ]] && exit 0
+  exit 1
+fi
+
+if [[ "$cmd" == "decompile" ]]; then
+  shift
+fi
+
+bin="${1:-}"
+out_dir="${2:-}"
+
+[[ -n "$bin" ]] || {
+  usage
+  exit 1
+}
+
+[[ -f "$bin" ]] || die "File not found: $bin"
+bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+
+script_dir="$(cd "$(dirname "$script_source")" && pwd)"
+script_name="DumpAllDecompile.java"
+if [[ -n "${GHIDRA_SCRIPT_PATH:-}" ]]; then
+  script_path="$GHIDRA_SCRIPT_PATH"
+elif [[ -f "$script_dir/$script_name" ]]; then
+  script_path="$script_dir"
+else
+  script_path="/scripts"
+fi
+script_file="$script_path/$script_name"
+[[ -f "$script_file" ]] || die "Ghidra script not found: $script_file"
+
+timeout="${GHIDRA_TIMEOUT:-120}"
+[[ "$timeout" =~ ^[0-9]+$ ]] || die "GHIDRA_TIMEOUT must be a positive integer"
+
+base_name="$(sanitize_name "$bin")"
+if [[ -z "$out_dir" ]]; then
+  out_dir="$PWD/${base_name}.ghidra-out"
+fi
+
+mkdir -p "$out_dir"
+out_dir="$(cd "$out_dir" && pwd)"
+
+project_dir="$(mktemp -d "${TMPDIR:-/tmp}/ghidra-project.XXXXXX")"
+project_name="reverse_project"
+analyze="$(find_analyze_headless)"
+
+cleanup() {
+  rm -rf "$project_dir"
+}
+trap cleanup EXIT
+
+echo "[+] Input      : $bin"
+echo "[+] Output dir : $out_dir"
+echo "[+] Analyzer   : $analyze"
+echo "[+] Running Ghidra headless analysis and extraction..."
+
+"$analyze" "$project_dir" "$project_name" \
+  -import "$bin" \
+  -scriptPath "$script_path" \
+  -postScript "$script_name" "$out_dir" "$base_name" "$timeout" \
+  -deleteProject
+
+echo "[+] Done"
+echo "[+] Pseudocode : $out_dir/${base_name}.pseudocode.c"
+echo "[+] Assembly   : $out_dir/${base_name}.disassembly.asm"
+echo "[+] Summary    : $out_dir/${base_name}.summary.txt"
