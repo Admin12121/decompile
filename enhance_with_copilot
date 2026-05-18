@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: enhance_with_copilot <binary> <output-dir> <base-name>
+
+Environment:
+  DECOMPILE_COPILOT_MODEL   Optional Copilot model name, for example gpt-5.2
+  DECOMPILE_COPILOT_EFFORT  Reasoning effort: low, medium, high, xhigh (default: high)
+  DECOMPILE_KEEP_COPILOT_DEBUG=1 keeps raw Copilot JSON/prompt/debug files
+EOF
+}
+
+die() {
+  echo "[-] $*" >&2
+  exit 1
+}
+
+extract_c_code() {
+  sed -e 's/\r$//' -e 's/^[[:space:]]*●[[:space:]]*//' |
+    awk '
+      BEGIN { in_code = 0 }
+      /^```/ { next }
+      /^[[:space:]]*#include[[:space:]]*</ { in_code = 1 }
+      /^[[:space:]]*#define[[:space:]]+/ { in_code = 1 }
+      /^[[:space:]]*typedef[[:space:]]+/ { in_code = 1 }
+      /^[[:space:]]*(static[[:space:]]+)?(int|void|char|uint|uint8_t|uint32_t|uint64_t|size_t|unsigned|const)[[:space:]\*]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(/ { in_code = 1 }
+      in_code { print }
+    '
+}
+
+binary="${1:-}"
+out_dir="${2:-}"
+base_name="${3:-}"
+
+[[ -n "$binary" && -n "$out_dir" && -n "$base_name" ]] || {
+  usage
+  exit 1
+}
+
+[[ -f "$binary" ]] || die "Binary not found: $binary"
+[[ -d "$out_dir" ]] || die "Output directory not found: $out_dir"
+command -v gh >/dev/null 2>&1 || die "GitHub CLI not found: gh"
+command -v jq >/dev/null 2>&1 || die "jq not found; needed to parse Copilot JSON output"
+
+pseudocode="$out_dir/${base_name}.pseudocode.c"
+disassembly="$out_dir/${base_name}.disassembly.asm"
+summary="$out_dir/${base_name}.summary.txt"
+objdump="$out_dir/${base_name}.objdump.txt"
+enhanced="$out_dir/${base_name}.enhanced.c"
+raw_response="$out_dir/${base_name}.enhanced.raw.jsonl"
+assistant_response="$out_dir/${base_name}.enhanced.response.txt"
+prompt_file="$out_dir/${base_name}.enhance.prompt.txt"
+fix_prompt_file="$out_dir/${base_name}.enhance.fix.prompt.txt"
+syntax_log="$out_dir/${base_name}.enhanced.syntax.log"
+
+[[ -f "$pseudocode" ]] || die "Missing pseudocode file: $pseudocode"
+[[ -f "$disassembly" ]] || die "Missing disassembly file: $disassembly"
+[[ -f "$summary" ]] || die "Missing summary file: $summary"
+[[ -f "$objdump" ]] || die "Missing objdump file: $objdump"
+
+cat >"$prompt_file" <<EOF
+You are reconstructing source code from reverse-engineering artifacts.
+
+Read these files before answering:
+- Ghidra pseudocode: $pseudocode
+- Ghidra disassembly: $disassembly
+- Ghidra summary: $summary
+- objdump output: $objdump
+- original binary path: $binary
+
+Task:
+Rebuild a clean, readable, recompileable C source file from the provided artifacts.
+
+Hard requirements:
+- Output ONLY C code.
+- Do not use Markdown fences.
+- Do not explain anything.
+- Do not add comments.
+- Do not include prose before or after the code.
+- Preserve program behavior as closely as possible.
+- Use meaningful function names and variable names.
+- Remove Ghidra/runtime noise such as stack canary boilerplate, PLT wrappers, _INIT/_FINI, entry stubs, and undefinedN typedef noise.
+- Use standard C headers and standard C types.
+- Replace raw DAT_/FUN_/PTR_ names with readable names.
+- Inline readable strings and constants when confidence is high.
+- Keep encoded byte arrays when needed for behavior.
+- If a decoded constant/string is recoverable from the bytes and disassembly, express it clearly in code.
+- The result should compile with a normal C compiler where possible.
+
+Return the complete C source file now.
+EOF
+
+args=(
+  copilot
+  -p "$(cat "$prompt_file")"
+  -s
+  --no-color
+  --stream off
+  --output-format json
+  --no-custom-instructions
+  --allow-all-tools
+  --add-dir "$out_dir"
+  --add-dir "$(dirname "$binary")"
+)
+
+if [[ -n "${DECOMPILE_COPILOT_MODEL:-}" ]]; then
+  args+=(--model "$DECOMPILE_COPILOT_MODEL")
+fi
+
+args+=(--effort "${DECOMPILE_COPILOT_EFFORT:-high}")
+
+echo "[+] Enhancing with GitHub Copilot CLI..."
+gh "${args[@]}" >"$raw_response"
+jq -sr '[.[] | select(.type == "assistant.message") | .data.content] | last // ""' "$raw_response" >"$assistant_response"
+extract_c_code <"$assistant_response" >"$enhanced"
+
+[[ -s "$enhanced" ]] || die "Copilot returned an empty enhanced file"
+
+if grep -q '^```' "$enhanced"; then
+  die "Copilot returned Markdown fences instead of plain C"
+fi
+
+if command -v gcc >/dev/null 2>&1; then
+  if ! gcc -fsyntax-only "$enhanced" >"$syntax_log" 2>&1; then
+    cat >"$fix_prompt_file" <<EOF
+The previous reconstruction did not compile.
+
+Read:
+- Current reconstructed C: $enhanced
+- Compiler errors: $syntax_log
+- Ghidra pseudocode: $pseudocode
+- Ghidra disassembly: $disassembly
+- objdump output: $objdump
+
+Fix the C source so it compiles with gcc -fsyntax-only.
+
+Hard requirements:
+- Output ONLY the complete fixed C source.
+- Do not use Markdown fences.
+- Do not explain anything.
+- Do not add comments.
+- Keep readable names.
+- Preserve the original program behavior.
+EOF
+
+    fix_raw="$out_dir/${base_name}.enhanced.fix.raw.jsonl"
+    fix_response="$out_dir/${base_name}.enhanced.fix.response.txt"
+    fix_args=(
+      copilot
+      -p "$(cat "$fix_prompt_file")"
+      -s
+      --no-color
+      --stream off
+      --output-format json
+      --no-custom-instructions
+      --allow-all-tools
+      --add-dir "$out_dir"
+      --add-dir "$(dirname "$binary")"
+      --effort "${DECOMPILE_COPILOT_EFFORT:-high}"
+    )
+    if [[ -n "${DECOMPILE_COPILOT_MODEL:-}" ]]; then
+      fix_args+=(--model "$DECOMPILE_COPILOT_MODEL")
+    fi
+
+    echo "[+] Copilot output did not compile; requesting one repair pass..."
+    gh "${fix_args[@]}" >"$fix_raw"
+    jq -sr '[.[] | select(.type == "assistant.message") | .data.content] | last // ""' "$fix_raw" >"$fix_response"
+    extract_c_code <"$fix_response" >"$enhanced"
+    [[ -s "$enhanced" ]] || die "Copilot repair returned an empty enhanced file"
+    gcc -fsyntax-only "$enhanced" >"$syntax_log" 2>&1 || die "Enhanced C still does not compile; see $syntax_log"
+  fi
+fi
+
+sed -i '/^Enhanced file[[:space:]]*:/d' "$summary"
+printf '\nEnhanced file          : %s\n' "$enhanced" >>"$summary"
+
+if [[ "${DECOMPILE_KEEP_COPILOT_DEBUG:-0}" != "1" ]]; then
+  rm -f "$raw_response" "$assistant_response" "$syntax_log" "$prompt_file" "$fix_prompt_file"
+  rm -f "$out_dir/${base_name}.enhanced.fix.raw.jsonl" "$out_dir/${base_name}.enhanced.fix.response.txt"
+fi
+
+echo "[+] Enhanced saved: $enhanced"

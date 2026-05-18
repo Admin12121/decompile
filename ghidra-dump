@@ -13,6 +13,8 @@ Environment:
   GHIDRA_ANALYZE_HEADLESS  Path to analyzeHeadless if it is not under /usr/share/ghidra
   GHIDRA_SCRIPT_PATH      Directory containing DumpAllDecompile.java (default: /scripts)
   GHIDRA_TIMEOUT          Per-function decompiler timeout in seconds (default: 120)
+  DECOMPILE_COPILOT_MODEL Optional Copilot model name for enhanced.c
+  DECOMPILE_COPILOT_EFFORT Copilot reasoning effort: low, medium, high, xhigh
 EOF
 }
 
@@ -71,16 +73,18 @@ out_dir="${2:-}"
 bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
 
 script_dir="$(cd "$(dirname "$script_source")" && pwd)"
-script_name="DumpAllDecompile.java"
+dump_script_name="DumpAllDecompile.java"
 if [[ -n "${GHIDRA_SCRIPT_PATH:-}" ]]; then
   script_path="$GHIDRA_SCRIPT_PATH"
-elif [[ -f "$script_dir/$script_name" ]]; then
+elif [[ -f "$script_dir/$dump_script_name" ]]; then
   script_path="$script_dir"
 else
   script_path="/scripts"
 fi
-script_file="$script_path/$script_name"
-[[ -f "$script_file" ]] || die "Ghidra script not found: $script_file"
+dump_script_file="$script_path/$dump_script_name"
+[[ -f "$dump_script_file" ]] || die "Ghidra script not found: $dump_script_file"
+enhancer="$script_dir/enhance_with_copilot"
+[[ -x "$enhancer" ]] || die "Copilot enhancer not found or not executable: $enhancer"
 
 timeout="${GHIDRA_TIMEOUT:-120}"
 [[ "$timeout" =~ ^[0-9]+$ ]] || die "GHIDRA_TIMEOUT must be a positive integer"
@@ -110,10 +114,29 @@ echo "[+] Running Ghidra headless analysis and extraction..."
 "$analyze" "$project_dir" "$project_name" \
   -import "$bin" \
   -scriptPath "$script_path" \
-  -postScript "$script_name" "$out_dir" "$base_name" "$timeout" \
+  -postScript "$dump_script_name" "$out_dir" "$base_name" "$timeout" \
   -deleteProject
+
+[[ -f "$out_dir/${base_name}.pseudocode.c" ]] || die "Pseudocode output was not created"
+[[ -f "$out_dir/${base_name}.disassembly.asm" ]] || die "Disassembly output was not created"
+[[ -f "$out_dir/${base_name}.summary.txt" ]] || die "Summary output was not created"
+
+if command -v objdump >/dev/null 2>&1; then
+  objdump -d -Mintel -s "$bin" >"$out_dir/${base_name}.objdump.txt" 2>"$out_dir/${base_name}.objdump.err" || true
+else
+  printf 'objdump not found\n' >"$out_dir/${base_name}.objdump.txt"
+fi
+
+"$enhancer" "$bin" "$out_dir" "$base_name"
+
+[[ -f "$out_dir/${base_name}.enhanced.c" ]] || die "Enhanced output was not created"
+
+if [[ "${DECOMPILE_KEEP_COPILOT_DEBUG:-0}" != "1" ]]; then
+  rm -f "$out_dir/${base_name}.objdump.txt" "$out_dir/${base_name}.objdump.err"
+fi
 
 echo "[+] Done"
 echo "[+] Pseudocode : $out_dir/${base_name}.pseudocode.c"
+echo "[+] Enhanced   : $out_dir/${base_name}.enhanced.c"
 echo "[+] Assembly   : $out_dir/${base_name}.disassembly.asm"
 echo "[+] Summary    : $out_dir/${base_name}.summary.txt"

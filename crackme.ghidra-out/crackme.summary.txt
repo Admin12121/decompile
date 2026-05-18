@@ -45,3 +45,5 @@ Memory blocks
   .comment .comment::00000000-.comment::0000002c size=45 execute=false write=false
   .shstrtab .shstrtab::00000000-.shstrtab::00000109 size=266 execute=false write=false
   _elfSectionHeaders _elfSectionHeaders::00000000-_elfSectionHeaders::0000073f size=1856 execute=false write=false
+
+Enhanced file          : /home/admin12121/SCRIPTS/decompiler/crackme.ghidra-out/crackme.enhanced.c

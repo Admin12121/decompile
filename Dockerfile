@@ -11,6 +11,8 @@ RUN apt-get clean && \
     apt-get install -y --fix-missing --no-install-recommends \
       ghidra \
       openjdk-21-jre-headless \
+      gh \
+      jq \
       file \
       binutils \
       coreutils \
@@ -21,8 +23,10 @@ RUN mkdir -p /scripts
 
 COPY DumpAllDecompile.java /scripts/DumpAllDecompile.java
 COPY ghidra-dump /usr/local/bin/ghidra-dump
+COPY enhance_with_copilot /usr/local/bin/enhance_with_copilot
 
 RUN chmod +x /usr/local/bin/ghidra-dump && \
+    chmod +x /usr/local/bin/enhance_with_copilot && \
     ln -s /usr/local/bin/ghidra-dump /usr/local/bin/code && \
     ln -s /usr/local/bin/ghidra-dump /usr/local/bin/decompile
 
