@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VERSION="${DECOMPILE_VERSION:-0.1.1}"
+VERSION="${DECOMPILE_VERSION:-0.1.2}"
 ARCH="${DECOMPILE_DEB_ARCH:-all}"
 DEB="${ROOT_DIR}/dist/decompile_${VERSION}_${ARCH}.deb"
 APT_DIR="${ROOT_DIR}/dist/apt"
