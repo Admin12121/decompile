@@ -36,7 +36,7 @@ cd /tmp/aur-decompile
 makepkg --printsrcinfo > .SRCINFO
 makepkg -si
 git add PKGBUILD .SRCINFO
-git commit -m "Initial release v0.1.0"
+git commit -m "Initial release v0.1.1"
 git push
 ```
 
@@ -54,7 +54,7 @@ Build the package:
 
 ```sh
 packaging/deb/build-deb.sh
-sudo apt install ./dist/decompile_0.1.0_all.deb
+sudo apt install ./dist/decompile_0.1.1_all.deb
 ```
 
 On Arch-based development machines, install `dpkg` first if `dpkg-deb` is missing.
