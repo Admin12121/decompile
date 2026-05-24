@@ -7,7 +7,7 @@ Usage: enhance_with_copilot <binary> <output-dir> <base-name>
 
 Environment:
   DECOMPILE_COPILOT_MODEL   Optional Copilot model name, for example gpt-5.2
-  DECOMPILE_COPILOT_EFFORT  Reasoning effort: low, medium, high, xhigh (default: high)
+  DECOMPILE_COPILOT_EFFORT  Optional reasoning effort: low, medium, high, xhigh
   DECOMPILE_KEEP_COPILOT_DEBUG=1 keeps raw Copilot JSON/prompt/debug files
   DECOMPILE_PYTHON       Optional Python interpreter used to parse Copilot JSON
 EOF
@@ -189,7 +189,9 @@ if [[ -n "${DECOMPILE_COPILOT_MODEL:-}" ]]; then
   args+=(--model "$DECOMPILE_COPILOT_MODEL")
 fi
 
-args+=(--effort "${DECOMPILE_COPILOT_EFFORT:-high}")
+if [[ -n "${DECOMPILE_COPILOT_EFFORT:-}" ]]; then
+  args+=(--effort "$DECOMPILE_COPILOT_EFFORT")
+fi
 
 echo "[+] Enhancing with GitHub Copilot CLI..."
 gh "${args[@]}" >"$raw_response"
@@ -238,8 +240,10 @@ EOF
       --allow-all-tools
       --add-dir "$out_dir"
       --add-dir "$(dirname "$binary")"
-      --effort "${DECOMPILE_COPILOT_EFFORT:-high}"
     )
+    if [[ -n "${DECOMPILE_COPILOT_EFFORT:-}" ]]; then
+      fix_args+=(--effort "$DECOMPILE_COPILOT_EFFORT")
+    fi
     if [[ -n "${DECOMPILE_COPILOT_MODEL:-}" ]]; then
       fix_args+=(--model "$DECOMPILE_COPILOT_MODEL")
     fi

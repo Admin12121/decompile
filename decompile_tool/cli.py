@@ -56,6 +56,8 @@ class CliOptions:
     no_ai: bool = False
     keep_debug: bool = False
     docker_image: str | None = None
+    copilot_model: str | None = None
+    copilot_effort: str | None = None
     update_image: bool = False
 
 
@@ -170,6 +172,22 @@ def parse_global_options(args: list[str]) -> tuple[list[str], CliOptions]:
             if index >= len(args):
                 raise DecompileError(f"{arg} requires an image name")
             options.docker_image = args[index]
+        elif arg == "--model":
+            index += 1
+            if index >= len(args):
+                raise DecompileError("--model requires a Copilot model name")
+            model = args[index].strip()
+            if not model or model.startswith("-"):
+                raise DecompileError("--model requires a Copilot model name")
+            options.copilot_model = model
+        elif arg == "--effort":
+            index += 1
+            if index >= len(args):
+                raise DecompileError("--effort requires one of: low, medium, high, xhigh")
+            effort = args[index].lower()
+            if effort not in {"low", "medium", "high", "xhigh"}:
+                raise DecompileError("--effort must be one of: low, medium, high, xhigh")
+            options.copilot_effort = effort
         else:
             cleaned.append(arg)
         index += 1
@@ -183,6 +201,10 @@ def apply_global_options(options: CliOptions) -> None:
         os.environ["DECOMPILE_KEEP_DEBUG"] = "1"
     if options.docker_image:
         os.environ["DECOMPILE_DOCKER_IMAGE"] = options.docker_image
+    if options.copilot_model:
+        os.environ["DECOMPILE_COPILOT_MODEL"] = options.copilot_model
+    if options.copilot_effort:
+        os.environ["DECOMPILE_COPILOT_EFFORT"] = options.copilot_effort
 
 
 def should_use_docker(force_local: bool) -> bool:
@@ -610,6 +632,8 @@ def print_usage() -> None:
   decompile <file-or-bundle> [output-dir]
   decompile --local <file-or-bundle> [output-dir]
   decompile --no-ai <file-or-bundle> [output-dir]
+  decompile <file-or-bundle> --model <model> [output-dir]
+  decompile <file-or-bundle> --effort <low|medium|high|xhigh> [output-dir]
   decompile --update [--image <image>]
   decompile doctor [--image <image>]
   decompile --image <image> <file-or-bundle> [output-dir]
@@ -632,7 +656,7 @@ Environment:
   DECOMPILE_NO_AI=1           skip Copilot enhanced C and copy pseudocode instead
   DECOMPILE_KEEP_DEBUG=1      keep objdump/prompt/raw debug files
   DECOMPILE_COPILOT_MODEL     optional Copilot model for enhanced.c
-  DECOMPILE_COPILOT_EFFORT    low, medium, high, xhigh; default high"""
+  DECOMPILE_COPILOT_EFFORT    optional low, medium, high, xhigh"""
     )
 
 

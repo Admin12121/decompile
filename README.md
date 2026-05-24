@@ -148,6 +148,8 @@ When AI is enabled, analysis context may be sent to GitHub Copilot through the h
 ```text
 decompile <file-or-bundle> [output-dir]
 decompile --no-ai <file-or-bundle> [output-dir]
+decompile <file-or-bundle> --model <model> [output-dir]
+decompile <file-or-bundle> --effort <low|medium|high|xhigh> [output-dir]
 decompile --update [--image <image>]
 decompile doctor [--image <image>]
 decompile --image <image> <file-or-bundle> [output-dir]
@@ -170,7 +172,7 @@ DECOMPILE_NO_AI=1           skip AI enhancement
 DECOMPILE_KEEP_DEBUG=1      keep objdump and prompt/debug files
 GHIDRA_TIMEOUT=120          per-function decompile timeout
 DECOMPILE_COPILOT_MODEL     optional host Copilot model
-DECOMPILE_COPILOT_EFFORT    low, medium, high, xhigh
+DECOMPILE_COPILOT_EFFORT    optional low, medium, high, xhigh
 ```
 
 ## Limits
