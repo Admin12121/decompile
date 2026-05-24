@@ -1,0 +1,5 @@
+.git
+test
+*.ghidra-out
+__pycache__
+*.pyc

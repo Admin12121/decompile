@@ -54,16 +54,7 @@ public class DumpAllDecompile extends GhidraScript {
         int skippedExternalFunctions = 0;
         int decompiledFunctions = 0;
         int failedDecompiles = 0;
-        int disassembledInstructions = 0;how to make it publish 
-
-apt install decompile
-yay -S decompile
-uv tool install decompile
-npx decompile
-
-what evert possible 
-
-in easy ways
+        int disassembledInstructions = 0;
 
         try (
             BufferedWriter pseudoWriter = new BufferedWriter(new FileWriter(pseudocodeFile, false));
