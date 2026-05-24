@@ -68,10 +68,8 @@ On Arch-based development machines, install `dpkg` first if `dpkg-deb` is missin
 Create a simple unsigned apt repository for testing:
 
 ```sh
-mkdir -p dist/apt
-cp dist/decompile_0.1.0_all.deb dist/apt/
+packaging/deb/build-apt-repo.sh
 cd dist/apt
-dpkg-scanpackages . /dev/null | gzip -9c > Packages.gz
 python3 -m http.server 8000
 ```
 
