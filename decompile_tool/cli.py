@@ -1,0 +1,824 @@
+#!/usr/bin/env python3
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
+APP_NAME = "decompile"
+DEFAULT_SUFFIX = ".ghidra-out"
+DEFAULT_DOCKER_IMAGE = "docker.io/admin12121/decompile:stable"
+DOCKER_PASSTHROUGH_ENV = {
+    "DECOMPILE_NO_AI",
+    "DECOMPILE_KEEP_DEBUG",
+    "DECOMPILE_KEEP_COPILOT_DEBUG",
+    "DECOMPILE_COPILOT_MODEL",
+    "DECOMPILE_COPILOT_EFFORT",
+    "GHIDRA_TIMEOUT",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+}
+NATIVE_KINDS = {"native", "elf", "pe", "macho", "native-unknown"}
+ANDROID_KINDS = {"apk", "aab", "dex"}
+JAVA_KINDS = {"jar", "class"}
+DOTNET_KINDS = {"dotnet"}
+
+
+class DecompileError(Exception):
+    pass
+
+
+@dataclass
+class Context:
+    input_path: Path
+    output_dir: Path
+    base_name: str
+    root_dir: Path
+    resource_dirs: list[Path]
+    keep_debug: bool
+    timeout: int
+    force_kind: str | None = None
+
+
+@dataclass
+class CliOptions:
+    force_local: bool = False
+    no_ai: bool = False
+    keep_debug: bool = False
+    docker_image: str | None = None
+    update_image: bool = False
+
+
+def main() -> int:
+    try:
+        args = normalize_args(sys.argv[1:])
+        if not args or args[0] in {"-h", "--help", "help"}:
+            print_usage()
+            return 0 if args else 1
+
+        args, options = parse_global_options(args)
+        apply_global_options(options)
+
+        if options.update_image:
+            if args:
+                raise DecompileError("--update does not take an input file")
+            return update_docker_image()
+
+        if should_use_docker(options.force_local):
+            return run_in_docker(args)
+
+        force_kind = None
+        if args and args[0] == "--type":
+            if len(args) < 3:
+                raise DecompileError("--type requires a type and input file")
+            force_kind = args[1]
+            args = args[2:]
+
+        if len(args) > 2:
+            raise DecompileError("too many arguments")
+
+        input_path = Path(args[0]).expanduser().resolve()
+        if not input_path.exists():
+            raise DecompileError(f"file not found: {input_path}")
+
+        base_name = sanitize_name(input_path.name)
+        output_dir = Path(args[1]).expanduser().resolve() if len(args) == 2 else Path.cwd() / f"{base_name}{DEFAULT_SUFFIX}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        root_dir = Path(__file__).resolve().parent
+        ctx = Context(
+            input_path=input_path,
+            output_dir=output_dir,
+            base_name=base_name,
+            root_dir=root_dir,
+            resource_dirs=resource_dirs(root_dir),
+            keep_debug=os.environ.get("DECOMPILE_KEEP_DEBUG") == "1" or os.environ.get("DECOMPILE_KEEP_COPILOT_DEBUG") == "1",
+            timeout=parse_timeout(),
+            force_kind=force_kind,
+        )
+
+        kind = force_kind or detect_kind(input_path)
+        print(f"[+] Input      : {ctx.input_path}")
+        print(f"[+] Output dir : {ctx.output_dir}")
+        print(f"[+] Type       : {kind}")
+
+        if kind in NATIVE_KINDS:
+            reverse_native(ctx, ctx.input_path, ctx.base_name)
+        elif kind in ANDROID_KINDS:
+            reverse_android(ctx, kind)
+        elif kind in JAVA_KINDS:
+            reverse_java(ctx, kind)
+        elif kind in DOTNET_KINDS:
+            reverse_dotnet(ctx)
+        elif kind == "ipa":
+            reverse_ipa(ctx)
+        elif kind == "app-bundle":
+            reverse_app_bundle(ctx)
+        else:
+            print("[!] Unknown format; falling back to Ghidra native import.")
+            reverse_native(ctx, ctx.input_path, ctx.base_name)
+
+        print_outputs(ctx)
+        return 0
+    except DecompileError as exc:
+        print(f"[-] {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("[-] interrupted", file=sys.stderr)
+        return 130
+
+
+def normalize_args(args: list[str]) -> list[str]:
+    if args and args[0] == "decompile":
+        return args[1:]
+    return args
+
+
+def parse_global_options(args: list[str]) -> tuple[list[str], CliOptions]:
+    cleaned = []
+    options = CliOptions()
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--local":
+            options.force_local = True
+        elif arg == "--no-ai":
+            options.no_ai = True
+        elif arg == "--keep-debug":
+            options.keep_debug = True
+        elif arg == "--update":
+            options.update_image = True
+        elif arg in {"--image", "--docker-image"}:
+            index += 1
+            if index >= len(args):
+                raise DecompileError(f"{arg} requires an image name")
+            options.docker_image = args[index]
+        else:
+            cleaned.append(arg)
+        index += 1
+    return cleaned, options
+
+
+def apply_global_options(options: CliOptions) -> None:
+    if options.no_ai:
+        os.environ["DECOMPILE_NO_AI"] = "1"
+    if options.keep_debug:
+        os.environ["DECOMPILE_KEEP_DEBUG"] = "1"
+    if options.docker_image:
+        os.environ["DECOMPILE_DOCKER_IMAGE"] = options.docker_image
+
+
+def should_use_docker(force_local: bool) -> bool:
+    if force_local or os.environ.get("DECOMPILE_IN_DOCKER") == "1":
+        return False
+
+    mode = os.environ.get("DECOMPILE_USE_DOCKER", "auto").lower()
+    if mode in {"0", "false", "no", "off", "local"}:
+        return False
+
+    docker = which("docker")
+    if docker:
+        return True
+
+    if mode in {"1", "true", "yes", "on", "docker"}:
+        raise DecompileError("Docker was requested but docker is not installed")
+
+    return False
+
+
+def run_in_docker(args: list[str]) -> int:
+    parsed = parse_docker_args(args)
+    image = docker_image_name()
+    ensure_docker_image(image)
+
+    input_path = parsed["input"].expanduser().resolve()
+    output_dir = parsed["output"].expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    input_mount = input_path.parent if input_path.is_file() else input_path.parent
+    input_in_container = Path("/input") / input_path.name
+
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--init",
+        "--hostname",
+        "decompile",
+        "--add-host",
+        "decompile:127.0.0.1",
+        "--cap-drop=ALL",
+        "--security-opt",
+        "no-new-privileges",
+    ]
+    if os.environ.get("DECOMPILE_NO_AI") == "1":
+        command.extend(["--network", "none"])
+
+    command.extend([
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "-e", "DECOMPILE_IN_DOCKER=1",
+        "-e", "HOME=/tmp/decompile-home",
+        "-v", f"{input_mount}:/input:ro",
+        "-v", f"{output_dir}:/out",
+    ])
+
+    gh_config = Path.home() / ".config" / "gh"
+    if gh_config.exists():
+        command.extend(["-v", f"{gh_config}:/tmp/decompile-home/.config/gh:ro"])
+
+    for name in sorted(DOCKER_PASSTHROUGH_ENV):
+        if name in os.environ:
+            command.extend(["-e", f"{name}={os.environ[name]}"])
+
+    command.append(image)
+    if parsed["force_kind"]:
+        command.extend(["--type", parsed["force_kind"]])
+    command.extend([str(input_in_container), "/out"])
+
+    print(f"[+] Docker image: {image}")
+    print("[+] Running isolated container analysis")
+    return subprocess.run(command).returncode
+
+
+def parse_docker_args(args: list[str]) -> dict:
+    force_kind = None
+    remaining = list(args)
+    if remaining and remaining[0] == "--type":
+        if len(remaining) < 3:
+            raise DecompileError("--type requires a type and input file")
+        force_kind = remaining[1]
+        remaining = remaining[2:]
+
+    if not remaining:
+        raise DecompileError("missing input file")
+    if len(remaining) > 2:
+        raise DecompileError("too many arguments")
+
+    input_path = Path(remaining[0])
+    if not input_path.exists():
+        raise DecompileError(f"file not found: {input_path}")
+
+    if len(remaining) == 2:
+        output_dir = Path(remaining[1])
+    else:
+        output_dir = Path.cwd() / f"{sanitize_name(input_path.name)}{DEFAULT_SUFFIX}"
+
+    return {"force_kind": force_kind, "input": input_path, "output": output_dir}
+
+
+def ensure_docker_image(image: str) -> None:
+    if subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return
+
+    print(f"[+] Docker image missing locally: {image}")
+    pull_docker_image(image)
+
+
+def update_docker_image() -> int:
+    image = docker_image_name()
+    print(f"[+] Updating Docker image: {image}")
+    pull_docker_image(image)
+    print("[+] Docker image is up to date locally")
+    return 0
+
+
+def pull_docker_image(image: str) -> None:
+    if not which("docker"):
+        raise DecompileError("Docker is not installed")
+
+    result = run(["docker", "pull", image], check=False)
+    if result.returncode == 0:
+        return
+
+    dockerfile = Path(__file__).resolve().parent / "Dockerfile"
+    if dockerfile.exists():
+        raise DecompileError(
+            f"could not pull Docker image: {image}. "
+            f"For local development, build it with: docker build -t {image} ."
+        )
+    raise DecompileError(f"could not pull Docker image: {image}")
+
+
+def docker_image_name() -> str:
+    return os.environ.get("DECOMPILE_DOCKER_IMAGE", DEFAULT_DOCKER_IMAGE)
+
+
+def print_usage() -> None:
+    print(
+"""Usage:
+  decompile <file-or-bundle> [output-dir]
+  decompile --local <file-or-bundle> [output-dir]
+  decompile --no-ai <file-or-bundle> [output-dir]
+  decompile --update [--image <image>]
+  decompile --image <image> <file-or-bundle> [output-dir]
+  decompile --type <native|apk|aab|dex|jar|class|dotnet|ipa|app-bundle> <file> [output-dir]
+
+Supported static routes:
+  native       ELF, PE/EXE/DLL, Mach-O, raw native binaries via Ghidra
+  apk/aab/dex  Android packages and dex files via JADX, apktool when available
+  jar/class    Java archives/classes via JADX when available
+  dotnet       .NET EXE/DLL via ilspycmd when available, native fallback
+  ipa          iOS IPA extraction plus Mach-O analysis of app executable
+  app-bundle   macOS/iOS .app bundle executable analysis
+
+Environment:
+  DECOMPILE_USE_DOCKER=0      disable Docker wrapper and run tools on host
+  DECOMPILE_DOCKER_IMAGE      image used by wrapper, default docker.io/admin12121/decompile:stable
+  GHIDRA_ANALYZE_HEADLESS     path to analyzeHeadless
+  GHIDRA_SCRIPT_PATH          directory containing DumpAllDecompile.java
+  GHIDRA_TIMEOUT              per-function timeout in seconds, default 120
+  DECOMPILE_NO_AI=1           skip Copilot enhanced C and copy pseudocode instead
+  DECOMPILE_KEEP_DEBUG=1      keep objdump/prompt/raw debug files
+  DECOMPILE_COPILOT_MODEL     optional Copilot model for enhanced.c
+  DECOMPILE_COPILOT_EFFORT    low, medium, high, xhigh; default high"""
+    )
+
+
+def sanitize_name(name: str) -> str:
+    cleaned = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+    return cleaned or "input"
+
+
+def parse_timeout() -> int:
+    raw = os.environ.get("GHIDRA_TIMEOUT", "120")
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError
+        return value
+    except ValueError:
+        raise DecompileError("GHIDRA_TIMEOUT must be a positive integer")
+
+
+def resource_dirs(root_dir: Path) -> list[Path]:
+    dirs = [
+        root_dir,
+        Path("/usr/local/share/decompile"),
+        Path("/usr/share/decompile"),
+        Path("/scripts"),
+    ]
+    return unique_paths([d for d in dirs if d.exists()])
+
+
+def unique_paths(paths: list[Path]) -> list[Path]:
+    seen = set()
+    out = []
+    for path in paths:
+        key = str(path.resolve())
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+
+def find_resource(ctx: Context, name: str) -> Path:
+    env_path = os.environ.get("GHIDRA_SCRIPT_PATH")
+    dirs = [Path(env_path)] if env_path else []
+    dirs.extend(ctx.resource_dirs)
+    for directory in dirs:
+        candidate = directory / name
+        if candidate.exists():
+            return candidate
+    raise DecompileError(f"required resource not found: {name}")
+
+
+def which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def run(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    stdout=None,
+    stderr=None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    display = " ".join(cmd)
+    print(f"[+] $ {display}")
+    result = subprocess.run(cmd, cwd=str(cwd) if cwd else None, stdout=stdout, stderr=stderr, text=False, env=env)
+    if check and result.returncode != 0:
+        raise DecompileError(f"command failed ({result.returncode}): {display}")
+    return result
+
+
+def isolated_tool_env(home: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
+    env["XDG_CACHE_HOME"] = str(home / ".cache")
+    env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+    env["DOTNET_CLI_HOME"] = str(home / ".dotnet")
+    for key in ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "DOTNET_CLI_HOME"]:
+        Path(env[key]).mkdir(parents=True, exist_ok=True)
+    return env
+
+
+def detect_kind(path: Path) -> str:
+    if path.is_dir():
+        if path.suffix.lower() == ".app":
+            return "app-bundle"
+        return "directory"
+
+    suffix = path.suffix.lower()
+    data = read_prefix(path, 8192)
+
+    if suffix == ".dex" or data.startswith(b"dex\n"):
+        return "dex"
+    if suffix in {".class"} and data.startswith(b"\xca\xfe\xba\xbe"):
+        return "class"
+
+    if zipfile.is_zipfile(path):
+        return detect_zip_kind(path, suffix)
+
+    if data.startswith(b"\x7fELF"):
+        return "elf"
+    if data.startswith(b"MZ"):
+        if contains_dotnet_metadata(path):
+            return "dotnet"
+        return "pe"
+    if is_macho_magic(data[:4]):
+        return "macho"
+
+    if suffix in {".exe", ".dll", ".sys"}:
+        return "pe"
+    if suffix in {".so", ".o", ".bin", ".out"}:
+        return "native-unknown"
+
+    return "unknown"
+
+
+def contains_dotnet_metadata(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            return b"BSJB" in fh.read(8 * 1024 * 1024)
+    except OSError:
+        return False
+
+
+def detect_zip_kind(path: Path, suffix: str) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            name_set = set(names)
+            lower_names = [n.lower() for n in names]
+            if suffix == ".ipa" or any(n.startswith("Payload/") and ".app/" in n for n in names):
+                return "ipa"
+            if suffix == ".apk" or ("AndroidManifest.xml" in name_set and any(n.startswith("classes") and n.endswith(".dex") for n in names)):
+                return "apk"
+            if suffix == ".aab" or any(n.endswith("/manifest/AndroidManifest.xml") for n in names):
+                return "aab"
+            if suffix in {".jar", ".war", ".ear"} or any(n.endswith(".class") for n in lower_names):
+                return "jar"
+    except zipfile.BadZipFile:
+        return "unknown"
+    return "archive"
+
+
+def read_prefix(path: Path, size: int) -> bytes:
+    try:
+        with path.open("rb") as fh:
+            return fh.read(size)
+    except OSError:
+        return b""
+
+
+def is_macho_magic(magic: bytes) -> bool:
+    return magic in {
+        b"\xfe\xed\xfa\xce",
+        b"\xce\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf",
+        b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+    }
+
+
+def find_analyze_headless() -> Path:
+    env_path = os.environ.get("GHIDRA_ANALYZE_HEADLESS")
+    if env_path:
+        candidate = Path(env_path)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+        raise DecompileError(f"GHIDRA_ANALYZE_HEADLESS is not executable: {candidate}")
+
+    from_path = which("analyzeHeadless")
+    if from_path:
+        return Path(from_path)
+
+    for root in [Path("/usr/share/ghidra"), Path("/opt")]:
+        if not root.exists():
+            continue
+        for current, _, files in os.walk(root):
+            if "analyzeHeadless" in files:
+                candidate = Path(current) / "analyzeHeadless"
+                if os.access(candidate, os.X_OK):
+                    return candidate
+    raise DecompileError("analyzeHeadless not found. Install Ghidra or set GHIDRA_ANALYZE_HEADLESS.")
+
+
+def reverse_native(ctx: Context, binary: Path, output_base: str) -> None:
+    dump_script = find_resource(ctx, "DumpAllDecompile.java")
+    analyze = find_analyze_headless()
+
+    project_dir = Path(tempfile.mkdtemp(prefix="ghidra-project."))
+    try:
+        print(f"[+] Analyzer   : {analyze}")
+        with tempfile.TemporaryDirectory(prefix="decompile-home.") as home:
+            run(
+                [
+                    str(analyze),
+                    str(project_dir),
+                    "reverse_project",
+                    "-import",
+                    str(binary),
+                    "-scriptPath",
+                    str(dump_script.parent),
+                    "-postScript",
+                    dump_script.name,
+                    str(ctx.output_dir),
+                    output_base,
+                    str(ctx.timeout),
+                    "-deleteProject",
+                ],
+                env=isolated_tool_env(Path(home)),
+            )
+    finally:
+        shutil.rmtree(project_dir, ignore_errors=True)
+
+    require_file(ctx.output_dir / f"{output_base}.pseudocode.c")
+    require_file(ctx.output_dir / f"{output_base}.disassembly.asm")
+    require_file(ctx.output_dir / f"{output_base}.summary.txt")
+
+    objdump_path = ctx.output_dir / f"{output_base}.objdump.txt"
+    objdump_err = ctx.output_dir / f"{output_base}.objdump.err"
+    generate_objdump(binary, objdump_path, objdump_err)
+    run_enhancer(ctx, binary, output_base)
+
+    require_file(ctx.output_dir / f"{output_base}.enhanced.c")
+    if not ctx.keep_debug:
+        safe_unlink(objdump_path)
+        safe_unlink(objdump_err)
+
+
+def generate_objdump(binary: Path, output: Path, error_output: Path) -> None:
+    objdump = which("objdump")
+    if not objdump:
+        output.write_text("objdump not found\n")
+        return
+    with output.open("wb") as stdout, error_output.open("wb") as stderr:
+        subprocess.run([objdump, "-d", "-Mintel", "-s", str(binary)], stdout=stdout, stderr=stderr, check=False)
+
+
+def run_enhancer(ctx: Context, binary: Path, output_base: str) -> None:
+    pseudocode = ctx.output_dir / f"{output_base}.pseudocode.c"
+    enhanced = ctx.output_dir / f"{output_base}.enhanced.c"
+
+    if os.environ.get("DECOMPILE_NO_AI") == "1":
+        print("[+] DECOMPILE_NO_AI=1; using raw pseudocode as enhanced.c fallback")
+        enhanced.write_text(pseudocode.read_text(errors="replace"), errors="replace")
+        append_summary(ctx.output_dir / f"{output_base}.summary.txt", f"Enhanced file          : {enhanced}")
+        return
+
+    enhancer = find_resource(ctx, "enhance_with_copilot")
+    if not os.access(enhancer, os.X_OK):
+        raise DecompileError(f"enhancer is not executable: {enhancer}")
+    run([str(enhancer), str(binary), str(ctx.output_dir), output_base])
+
+
+def reverse_android(ctx: Context, kind: str) -> None:
+    summary = ctx.output_dir / f"{ctx.base_name}.summary.txt"
+    write_summary_header(summary, ctx, kind)
+
+    source_dir = ctx.output_dir / "source"
+    source_dir.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="decompile-home.") as home:
+        tool_env = isolated_tool_env(Path(home))
+        jadx = which("jadx")
+        if jadx:
+            args = [jadx, "-d", str(source_dir)]
+            extra = os.environ.get("DECOMPILE_JADX_ARGS", "").strip()
+            if extra:
+                args.extend(extra.split())
+            args.append(str(ctx.input_path))
+            result = run(args, check=False, env=tool_env)
+            append_summary(summary, f"JADX exit code       : {result.returncode}")
+        else:
+            append_summary(summary, "JADX               : missing; install jadx for Android/Java source output")
+
+        if kind == "apk":
+            apktool = which("apktool")
+            if apktool:
+                resources_dir = ctx.output_dir / "resources"
+                with tempfile.TemporaryDirectory(prefix="apktool-framework.") as frame_dir:
+                    result = run([apktool, "d", "-f", "-p", frame_dir, "-o", str(resources_dir), str(ctx.input_path)], check=False, env=tool_env)
+                append_summary(summary, f"apktool exit code    : {result.returncode}")
+            else:
+                append_summary(summary, "apktool            : missing; resources were not decoded")
+
+    write_android_summary(summary, ctx, source_dir)
+
+
+def reverse_java(ctx: Context, kind: str) -> None:
+    summary = ctx.output_dir / f"{ctx.base_name}.summary.txt"
+    write_summary_header(summary, ctx, kind)
+
+    source_dir = ctx.output_dir / "source"
+    source_dir.mkdir(exist_ok=True)
+    jadx = which("jadx")
+    if not jadx:
+        append_summary(summary, "JADX               : missing; install jadx for Java archive decompilation")
+        raise DecompileError("jadx not found; cannot decompile Java/Dex input")
+
+    with tempfile.TemporaryDirectory(prefix="decompile-home.") as home:
+        result = run([jadx, "-d", str(source_dir), str(ctx.input_path)], check=False, env=isolated_tool_env(Path(home)))
+    append_summary(summary, f"JADX exit code       : {result.returncode}")
+    write_android_summary(summary, ctx, source_dir)
+
+
+def reverse_dotnet(ctx: Context) -> None:
+    ilspy = which("ilspycmd")
+    if not ilspy:
+        print("[!] Detected .NET metadata, but ilspycmd is not installed; falling back to Ghidra PE analysis.")
+        reverse_native(ctx, ctx.input_path, ctx.base_name)
+        summary = ctx.output_dir / f"{ctx.base_name}.summary.txt"
+        append_summary(summary, "Detected .NET       : yes")
+        append_summary(summary, "ilspycmd            : missing; used native fallback")
+        return
+
+    summary = ctx.output_dir / f"{ctx.base_name}.summary.txt"
+    write_summary_header(summary, ctx, "dotnet")
+    source_dir = ctx.output_dir / "source"
+    source_dir.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="decompile-home.") as home:
+        result = run([ilspy, "-p", "-o", str(source_dir), str(ctx.input_path)], check=False, env=isolated_tool_env(Path(home)))
+    append_summary(summary, f"ilspycmd exit code  : {result.returncode}")
+    append_summary(summary, f"C# source directory : {source_dir}")
+    append_summary(summary, f"C# files            : {count_files(source_dir, {'.cs'})}")
+
+
+def reverse_ipa(ctx: Context) -> None:
+    summary = ctx.output_dir / f"{ctx.base_name}.summary.txt"
+    with tempfile.TemporaryDirectory(prefix="decompile-ipa.") as tmp:
+        tmp_path = Path(tmp)
+        executable, app_name, info = extract_ipa_executable(ctx.input_path, tmp_path)
+        if info:
+            ios_dir = ctx.output_dir / "ios"
+            ios_dir.mkdir(exist_ok=True)
+            with (ios_dir / "Info.plist").open("wb") as fh:
+                plistlib.dump(info, fh)
+
+        reverse_native(ctx, executable, ctx.base_name)
+        append_summary(summary, "")
+        append_summary(summary, "Container            : IPA")
+        append_summary(summary, f"App bundle           : {app_name}")
+        append_summary(summary, f"Extracted executable : {executable.name}")
+
+
+def reverse_app_bundle(ctx: Context) -> None:
+    executable, info = find_app_bundle_executable(ctx.input_path)
+    if info:
+        ios_dir = ctx.output_dir / "app"
+        ios_dir.mkdir(exist_ok=True)
+        with (ios_dir / "Info.plist").open("wb") as fh:
+            plistlib.dump(info, fh)
+    reverse_native(ctx, executable, ctx.base_name)
+    append_summary(ctx.output_dir / f"{ctx.base_name}.summary.txt", f"App executable       : {executable}")
+
+
+def extract_ipa_executable(ipa: Path, tmp_path: Path) -> tuple[Path, str, dict | None]:
+    with zipfile.ZipFile(ipa) as archive:
+        names = archive.namelist()
+        app_roots = sorted({n.split("/", 2)[1] for n in names if n.startswith("Payload/") and ".app/" in n})
+        if not app_roots:
+            raise DecompileError("IPA does not contain Payload/*.app")
+
+        app_name = app_roots[0]
+        info_path = f"Payload/{app_name}/Info.plist"
+        info = None
+        executable_name = None
+        if info_path in names:
+            info = plistlib.loads(archive.read(info_path))
+            executable_name = info.get("CFBundleExecutable")
+
+        executable_member = f"Payload/{app_name}/{executable_name}" if executable_name else None
+        if executable_member not in names:
+            executable_member = find_macho_member(archive, names, f"Payload/{app_name}/")
+        if not executable_member:
+            raise DecompileError("could not find Mach-O executable inside IPA")
+
+        extracted = tmp_path / Path(executable_member).name
+        extracted.write_bytes(archive.read(executable_member))
+        extracted.chmod(0o755)
+        return extracted, app_name, info
+
+
+def find_macho_member(archive: zipfile.ZipFile, names: list[str], prefix: str) -> str | None:
+    for name in names:
+        if not name.startswith(prefix) or name.endswith("/") or "/" in name[len(prefix):]:
+            continue
+        try:
+            if is_macho_magic(archive.read(name)[:4]):
+                return name
+        except KeyError:
+            continue
+    return None
+
+
+def find_app_bundle_executable(bundle: Path) -> tuple[Path, dict | None]:
+    info = None
+    info_path = bundle / "Info.plist"
+    if not info_path.exists():
+        info_path = bundle / "Contents" / "Info.plist"
+    if info_path.exists():
+        info = plistlib.loads(info_path.read_bytes())
+        executable_name = info.get("CFBundleExecutable")
+        if executable_name:
+            for candidate in [bundle / executable_name, bundle / "Contents" / "MacOS" / executable_name]:
+                if candidate.exists():
+                    return candidate, info
+
+    for candidate in bundle.iterdir():
+        if candidate.is_file() and is_macho_magic(read_prefix(candidate, 4)):
+            return candidate, info
+    macos_dir = bundle / "Contents" / "MacOS"
+    if macos_dir.exists():
+        for candidate in macos_dir.iterdir():
+            if candidate.is_file() and is_macho_magic(read_prefix(candidate, 4)):
+                return candidate, info
+    raise DecompileError(f"could not find app executable in {bundle}")
+
+
+def write_summary_header(summary: Path, ctx: Context, kind: str) -> None:
+    summary.write_text(
+        "\n".join(
+            [
+                "REVERSE EXTRACTION SUMMARY",
+                "=" * 100,
+                f"Input      : {ctx.input_path}",
+                f"Type       : {kind}",
+                f"Output dir : {ctx.output_dir}",
+                "=" * 100,
+                "",
+            ]
+        )
+    )
+
+
+def write_android_summary(summary: Path, ctx: Context, source_dir: Path) -> None:
+    java_count = count_files(source_dir, {".java"})
+    kt_count = count_files(source_dir, {".kt"})
+    smali_count = count_files(ctx.output_dir / "resources", {".smali"})
+    append_summary(summary, f"Source directory     : {source_dir}")
+    append_summary(summary, f"Java files           : {java_count}")
+    append_summary(summary, f"Kotlin files         : {kt_count}")
+    if (ctx.output_dir / "resources").exists():
+        append_summary(summary, f"Resources directory  : {ctx.output_dir / 'resources'}")
+        append_summary(summary, f"Smali files          : {smali_count}")
+
+
+def count_files(root: Path, suffixes: set[str]) -> int:
+    if not root.exists():
+        return 0
+    return sum(1 for p in root.rglob("*") if p.is_file() and p.suffix.lower() in suffixes)
+
+
+def append_summary(summary: Path, line: str) -> None:
+    with summary.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def require_file(path: Path) -> None:
+    if not path.is_file():
+        raise DecompileError(f"expected output was not created: {path}")
+
+
+def safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def print_outputs(ctx: Context) -> None:
+    print("[+] Done")
+    for path in sorted(ctx.output_dir.iterdir()):
+        if path.is_file() and path.suffix in {".asm", ".c", ".txt"}:
+            print(f"[+] Output     : {path}")
+        elif path.is_dir() and path.name in {"source", "resources", "ios", "app"}:
+            print(f"[+] Output     : {path}/")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

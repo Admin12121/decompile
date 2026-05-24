@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decompile"
+version = "0.1.0"
+description = "Docker-isolated static reverse engineering orchestrator"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Admin12121" }
+]
+keywords = [
+  "reverse-engineering",
+  "decompiler",
+  "ghidra",
+  "jadx",
+  "ilspy",
+  "docker",
+  "ctf"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Security",
+  "Topic :: Utilities"
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Admin12121/decompile"
+Repository = "https://github.com/Admin12121/decompile"
+Issues = "https://github.com/Admin12121/decompile/issues"
+
+[project.scripts]
+decompile = "decompile_tool.cli:main"
+
+[tool.setuptools]
+packages = ["decompile_tool"]
+
+[tool.setuptools.package-data]
+decompile_tool = ["DumpAllDecompile.java", "enhance_with_copilot"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["__pycache__/*", "*.pyc", "*.pyo"]

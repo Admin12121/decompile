@@ -1,0 +1,12 @@
+Package: decompile
+Version: @VERSION@
+Section: devel
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Admin12121 <admin12121@users.noreply.github.com>
+Depends: python3, docker.io | docker-ce | podman-docker
+Recommends: ca-certificates
+Description: Docker-isolated static reverse engineering orchestrator
+ decompile detects executable, mobile, Java, and .NET inputs and runs the
+ project Docker image to produce static reverse-engineering output without
+ installing Ghidra, JADX, apktool, or ILSpy on the host.
