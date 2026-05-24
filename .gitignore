@@ -4,3 +4,5 @@ dist/
 __pycache__/
 *.pyc
 *.ghidra-out/
+.env
+script.sh

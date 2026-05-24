@@ -5,16 +5,10 @@ This project publishes a small host CLI. The heavy reverse-engineering tools sta
 ## Release checklist
 
 ```sh
-VERSION=0.1.0
-IMAGE=admin12121/decompile
-
-git tag "v$VERSION"
-git push origin main "v$VERSION"
-
-docker build -t "$IMAGE:$VERSION" -t "$IMAGE:stable" .
-docker push "$IMAGE:$VERSION"
-docker push "$IMAGE:stable"
+packaging/release.sh 0.1.1
 ```
+
+The release script updates versions, builds and pushes the Docker image, pushes the GitHub tag, uploads PyPI artifacts, updates AUR, and publishes the GitHub Pages installer/apt repo.
 
 ## PyPI / pip
 
