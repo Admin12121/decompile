@@ -8,6 +8,8 @@ DEB="${ROOT_DIR}/dist/decompile_${VERSION}_${ARCH}.deb"
 APT_DIR="${ROOT_DIR}/dist/apt"
 APT_DEB="${APT_DIR}/$(basename "${DEB}")"
 PACKAGES="${APT_DIR}/Packages"
+INSTALLER="${ROOT_DIR}/dist/install.sh"
+INDEX="${ROOT_DIR}/dist/index.html"
 
 if ! command -v dpkg-deb >/dev/null 2>&1; then
   echo "dpkg-deb not found. Build this repo inside the decompile Docker image or install dpkg." >&2
@@ -36,7 +38,16 @@ dpkg-deb -f "${APT_DEB}" > "${PACKAGES}"
   printf 'SHA256: %s\n\n' "${sha256}"
 } >> "${PACKAGES}"
 
-gzip -9c "${PACKAGES}" > "${PACKAGES}.gz"
+gzip -9nc "${PACKAGES}" > "${PACKAGES}.gz"
+install -m 0755 "${ROOT_DIR}/packaging/deb/install.sh" "${INSTALLER}"
+
+cat > "${INDEX}" <<EOF
+<!doctype html>
+<title>decompile installer</title>
+<pre>
+curl -fsSL https://admin12121.github.io/decompile/install.sh | sudo bash
+</pre>
+EOF
 
 cat > "${APT_DIR}/index.html" <<EOF
 <!doctype html>
@@ -47,3 +58,4 @@ deb [trusted=yes] https://admin12121.github.io/decompile/apt ./
 EOF
 
 echo "${APT_DIR}"
+echo "${INSTALLER}"

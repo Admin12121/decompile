@@ -69,16 +69,14 @@ Create a simple unsigned apt repository for testing:
 
 ```sh
 packaging/deb/build-apt-repo.sh
-cd dist/apt
+cd dist
 python3 -m http.server 8000
 ```
 
 On a test client:
 
 ```sh
-echo "deb [trusted=yes] http://127.0.0.1:8000 ./" | sudo tee /etc/apt/sources.list.d/decompile.list
-sudo apt update
-sudo apt install decompile
+curl -fsSL http://127.0.0.1:8000/install.sh | sudo env DECOMPILE_APT_REPO_URL=http://127.0.0.1:8000/apt bash
 ```
 
 For public apt distribution, use a signed repository or a package-hosting service instead of `trusted=yes`.

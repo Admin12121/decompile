@@ -7,15 +7,15 @@ Install the small host command, run `decompile ./file`, and the heavy tools run 
 ## Install
 
 ```sh
-pip install decompile
-decompile --update
+curl -fsSL https://admin12121.github.io/decompile/install.sh | sudo bash
 ```
 
 Other package targets:
 
 ```sh
+pip install decompile
+decompile --update
 yay -S decompile
-sudo apt install ./decompile_0.1.0_all.deb
 ```
 
 Docker is required for the normal published workflow.
