@@ -9,6 +9,7 @@ Environment:
   DECOMPILE_COPILOT_MODEL   Optional Copilot model name, for example gpt-5.2
   DECOMPILE_COPILOT_EFFORT  Reasoning effort: low, medium, high, xhigh (default: high)
   DECOMPILE_KEEP_COPILOT_DEBUG=1 keeps raw Copilot JSON/prompt/debug files
+  DECOMPILE_PYTHON       Optional Python interpreter used to parse Copilot JSON
 EOF
 }
 
@@ -42,7 +43,86 @@ base_name="${3:-}"
 [[ -f "$binary" ]] || die "Binary not found: $binary"
 [[ -d "$out_dir" ]] || die "Output directory not found: $out_dir"
 command -v gh >/dev/null 2>&1 || die "GitHub CLI not found: gh"
-command -v jq >/dev/null 2>&1 || die "jq not found; needed to parse Copilot JSON output"
+
+if [[ -n "${DECOMPILE_PYTHON:-}" ]]; then
+  python_cmd="$DECOMPILE_PYTHON"
+elif command -v python3 >/dev/null 2>&1; then
+  python_cmd="python3"
+elif command -v python >/dev/null 2>&1; then
+  python_cmd="python"
+else
+  die "Python not found; needed to parse Copilot JSON output"
+fi
+
+copilot_json_to_text() {
+  local input="$1"
+  local output="$2"
+
+  "$python_cmd" - "$input" "$output" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def content_to_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    if isinstance(value, dict):
+        text = value.get("text") or value.get("content")
+        if isinstance(text, str):
+            return text
+    return ""
+
+
+def json_values(text):
+    decoder = json.JSONDecoder()
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            next_object = text.find("{", index + 1)
+            if next_object == -1:
+                break
+            index = next_object
+            continue
+        if isinstance(value, list):
+            yield from value
+        else:
+            yield value
+
+
+input_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+last_message = ""
+
+for item in json_values(input_path.read_text(encoding="utf-8", errors="replace")):
+    if not isinstance(item, dict) or item.get("type") != "assistant.message":
+        continue
+    data = item.get("data")
+    if isinstance(data, dict):
+        content = content_to_text(data.get("content"))
+        if content:
+            last_message = content
+
+output_path.write_text(last_message + ("\n" if last_message and not last_message.endswith("\n") else ""), encoding="utf-8")
+PY
+}
 
 pseudocode="$out_dir/${base_name}.pseudocode.c"
 disassembly="$out_dir/${base_name}.disassembly.asm"
@@ -113,7 +193,7 @@ args+=(--effort "${DECOMPILE_COPILOT_EFFORT:-high}")
 
 echo "[+] Enhancing with GitHub Copilot CLI..."
 gh "${args[@]}" >"$raw_response"
-jq -sr '[.[] | select(.type == "assistant.message") | .data.content] | last // ""' "$raw_response" >"$assistant_response"
+copilot_json_to_text "$raw_response" "$assistant_response"
 extract_c_code <"$assistant_response" >"$enhanced"
 
 [[ -s "$enhanced" ]] || die "Copilot returned an empty enhanced file"
@@ -166,7 +246,7 @@ EOF
 
     echo "[+] Copilot output did not compile; requesting one repair pass..."
     gh "${fix_args[@]}" >"$fix_raw"
-    jq -sr '[.[] | select(.type == "assistant.message") | .data.content] | last // ""' "$fix_raw" >"$fix_response"
+    copilot_json_to_text "$fix_raw" "$fix_response"
     extract_c_code <"$fix_response" >"$enhanced"
     [[ -s "$enhanced" ]] || die "Copilot repair returned an empty enhanced file"
     gcc -fsyntax-only "$enhanced" >"$syntax_log" 2>&1 || die "Enhanced C still does not compile; see $syntax_log"

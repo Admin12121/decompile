@@ -387,12 +387,11 @@ def run_host_ai_enhancement(input_path: Path, output_dir: Path, base_name: str, 
         return 0
 
     try:
-        for tool in ["gh", "jq"]:
-            if not which(tool):
-                raise DecompileError(
-                    f"AI enhancement runs on the host, but '{tool}' is not installed. "
-                    "Install GitHub CLI/Copilot tools or rerun with --no-ai."
-                )
+        if not which("gh"):
+            raise DecompileError(
+                "AI enhancement runs on the host, but 'gh' is not installed. "
+                "Install GitHub CLI/Copilot tools or rerun with --no-ai."
+            )
 
         copilot = subprocess.run(["gh", "copilot", "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if copilot.returncode != 0:
@@ -429,6 +428,7 @@ def run_host_ai_enhancement(input_path: Path, output_dir: Path, base_name: str, 
                 shutil.copyfile(source, target)
 
         env = os.environ.copy()
+        env["DECOMPILE_PYTHON"] = sys.executable
         if keep_debug:
             env["DECOMPILE_KEEP_COPILOT_DEBUG"] = "1"
         else:
@@ -683,7 +683,7 @@ def run_doctor(options: CliOptions) -> int:
     if analyze:
         add("OK", "analyzeHeadless", str(analyze))
 
-    for tool in ["jadx", "apktool", "ilspycmd", "objdump", "readelf", "nm", "file", "gcc", "jq"]:
+    for tool in ["jadx", "apktool", "ilspycmd", "objdump", "readelf", "nm", "file", "gcc"]:
         path = which(tool)
         add("OK" if path else "WARN", tool, path or "missing; needed only for related input types")
 

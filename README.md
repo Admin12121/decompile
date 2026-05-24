@@ -133,7 +133,6 @@ This phase runs on the host with:
 ```text
 gh
 gh copilot
-jq
 ```
 
 Disable it for malware, private samples, offline work, or reproducible local-only output:
