@@ -56,6 +56,7 @@ class CliOptions:
     no_ai: bool = False
     keep_debug: bool = False
     docker_image: str | None = None
+    update_image: bool = False
 
 
 def main() -> int:
@@ -67,6 +68,12 @@ def main() -> int:
 
         args, options = parse_global_options(args)
         apply_global_options(options)
+
+        if options.update_image:
+            if args:
+                raise DecompileError("--update does not take an input file")
+            return update_docker_image()
+
         if should_use_docker(options.force_local):
             return run_in_docker(args)
 
@@ -149,10 +156,12 @@ def parse_global_options(args: list[str]) -> tuple[list[str], CliOptions]:
             options.no_ai = True
         elif arg == "--keep-debug":
             options.keep_debug = True
-        elif arg == "--docker-image":
+        elif arg == "--update":
+            options.update_image = True
+        elif arg in {"--image", "--docker-image"}:
             index += 1
             if index >= len(args):
-                raise DecompileError("--docker-image requires an image name")
+                raise DecompileError(f"{arg} requires an image name")
             options.docker_image = args[index]
         else:
             cleaned.append(arg)
@@ -189,7 +198,7 @@ def should_use_docker(force_local: bool) -> bool:
 
 def run_in_docker(args: list[str]) -> int:
     parsed = parse_docker_args(args)
-    image = os.environ.get("DECOMPILE_DOCKER_IMAGE", DEFAULT_DOCKER_IMAGE)
+    image = docker_image_name()
     ensure_docker_image(image)
 
     input_path = parsed["input"].expanduser().resolve()
@@ -271,13 +280,37 @@ def ensure_docker_image(image: str) -> None:
     if subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         return
 
-    auto_build = os.environ.get("DECOMPILE_AUTO_BUILD", "1").lower()
-    dockerfile = Path(__file__).resolve().parent / "Dockerfile"
-    if auto_build in {"0", "false", "no", "off"} or not dockerfile.exists():
-        raise DecompileError(f"Docker image not found: {image}. Build it with: docker build -t {image} .")
+    print(f"[+] Docker image missing locally: {image}")
+    pull_docker_image(image)
 
-    print(f"[+] Docker image {image} not found; building local image...")
-    run(["docker", "build", "-t", image, str(dockerfile.parent)])
+
+def update_docker_image() -> int:
+    image = docker_image_name()
+    print(f"[+] Updating Docker image: {image}")
+    pull_docker_image(image)
+    print("[+] Docker image is up to date locally")
+    return 0
+
+
+def pull_docker_image(image: str) -> None:
+    if not which("docker"):
+        raise DecompileError("Docker is not installed")
+
+    result = run(["docker", "pull", image], check=False)
+    if result.returncode == 0:
+        return
+
+    dockerfile = Path(__file__).resolve().parent / "Dockerfile"
+    if dockerfile.exists():
+        raise DecompileError(
+            f"could not pull Docker image: {image}. "
+            f"For local development, build it with: docker build -t {image} ."
+        )
+    raise DecompileError(f"could not pull Docker image: {image}")
+
+
+def docker_image_name() -> str:
+    return os.environ.get("DECOMPILE_DOCKER_IMAGE", DEFAULT_DOCKER_IMAGE)
 
 
 def print_usage() -> None:
@@ -286,7 +319,8 @@ def print_usage() -> None:
   decompile <file-or-bundle> [output-dir]
   decompile --local <file-or-bundle> [output-dir]
   decompile --no-ai <file-or-bundle> [output-dir]
-  decompile --docker-image <image> <file-or-bundle> [output-dir]
+  decompile --update [--image <image>]
+  decompile --image <image> <file-or-bundle> [output-dir]
   decompile --type <native|apk|aab|dex|jar|class|dotnet|ipa|app-bundle> <file> [output-dir]
 
 Supported static routes:
@@ -300,7 +334,6 @@ Supported static routes:
 Environment:
   DECOMPILE_USE_DOCKER=0      disable Docker wrapper and run tools on host
   DECOMPILE_DOCKER_IMAGE      image used by wrapper, default decompile:latest
-  DECOMPILE_AUTO_BUILD=0      disable auto-building local Dockerfile when image is missing
   GHIDRA_ANALYZE_HEADLESS     path to analyzeHeadless
   GHIDRA_SCRIPT_PATH          directory containing DumpAllDecompile.java
   GHIDRA_TIMEOUT              per-function timeout in seconds, default 120
