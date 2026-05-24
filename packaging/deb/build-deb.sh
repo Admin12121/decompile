@@ -28,7 +28,7 @@ find "${PKG_ROOT}/usr/share/decompile/decompile_tool" -type f -exec chmod 0644 {
 chmod 0755 "${PKG_ROOT}/usr/share/decompile/decompile_tool/cli.py"
 chmod 0755 "${PKG_ROOT}/usr/share/decompile/decompile_tool/enhance_with_copilot"
 
-install -m 0644 "${ROOT_DIR}/CAPABILITIES.md" "${PKG_ROOT}/usr/share/doc/decompile/CAPABILITIES.md"
+install -m 0644 "${ROOT_DIR}/README.md" "${PKG_ROOT}/usr/share/doc/decompile/README.md"
 sed \
   -e "s/@VERSION@/${VERSION}/g" \
   -e "s/@ARCH@/${ARCH}/g" \

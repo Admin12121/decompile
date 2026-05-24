@@ -23,5 +23,5 @@ package() {
   chmod 0755 "${pkgdir}/usr/share/decompile/decompile_tool/cli.py"
   chmod 0755 "${pkgdir}/usr/share/decompile/decompile_tool/enhance_with_copilot"
 
-  install -Dm644 CAPABILITIES.md "${pkgdir}/usr/share/doc/decompile/CAPABILITIES.md"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/decompile/README.md"
 }

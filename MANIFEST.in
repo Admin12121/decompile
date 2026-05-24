@@ -1,4 +1,4 @@
-include CAPABILITIES.md
+include README.md
 include Dockerfile
 include DumpAllDecompile.java
 include enhance_with_copilot
