@@ -58,19 +58,25 @@ Supported routes:
 Native binary output:
 
 ```text
-<name>.disassembly.asm
-<name>.pseudocode.c
-<name>.enhanced.c
-<name>.summary.txt
+summary.txt
+metadata.json
+disassembly.asm
+pseudocode.c
+enhanced.c
 ```
 
 Android, Java, and .NET output usually includes:
 
 ```text
+summary.txt
+metadata.json
 source/
 resources/
-<name>.summary.txt
 ```
+
+`summary.txt` is the human report. It includes file type, architecture, entropy, sections, imports, symbols, strings, tool exit status, and decompiler details when available.
+
+`metadata.json` is the machine-readable version for scripts and future UI work.
 
 ## Docker Model
 
@@ -132,9 +138,16 @@ When AI is enabled, analysis context may be sent to GitHub Copilot through `gh`.
 decompile <file-or-bundle> [output-dir]
 decompile --no-ai <file-or-bundle> [output-dir]
 decompile --update [--image <image>]
+decompile doctor [--image <image>]
 decompile --image <image> <file-or-bundle> [output-dir]
 decompile --local <file-or-bundle> [output-dir]
 decompile --type <native|apk|aab|dex|jar|class|dotnet|ipa|app-bundle> <file> [output-dir]
+```
+
+Check the host, Docker, image, GitHub auth, bundled resources, and local tools:
+
+```sh
+decompile doctor
 ```
 
 Useful environment variables:

@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 import os
+import hashlib
+import json
+import math
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -48,6 +53,8 @@ class Context:
     keep_debug: bool
     timeout: int
     force_kind: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+    tool_statuses: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -73,6 +80,11 @@ def main() -> int:
             if args:
                 raise DecompileError("--update does not take an input file")
             return update_docker_image()
+
+        if args and args[0] == "doctor":
+            if len(args) > 1:
+                raise DecompileError("doctor does not take extra arguments")
+            return run_doctor(options)
 
         if should_use_docker(options.force_local):
             return run_in_docker(args)
@@ -108,6 +120,7 @@ def main() -> int:
         )
 
         kind = force_kind or detect_kind(input_path)
+        initialize_metadata(ctx, kind)
         print(f"[+] Input      : {ctx.input_path}")
         print(f"[+] Output dir : {ctx.output_dir}")
         print(f"[+] Type       : {kind}")
@@ -128,6 +141,7 @@ def main() -> int:
             print("[!] Unknown format; falling back to Ghidra native import.")
             reverse_native(ctx, ctx.input_path, ctx.base_name)
 
+        finalize_outputs(ctx, kind)
         print_outputs(ctx)
         return 0
     except DecompileError as exc:
@@ -190,15 +204,16 @@ def should_use_docker(force_local: bool) -> bool:
     if docker:
         return True
 
-    if mode in {"1", "true", "yes", "on", "docker"}:
-        raise DecompileError("Docker was requested but docker is not installed")
-
-    return False
+    raise DecompileError(
+        "Docker is not installed or not in PATH. Install Docker, then run this command again. "
+        "Use --local only when Ghidra/JADX/apktool/ilspycmd are installed on the host."
+    )
 
 
 def run_in_docker(args: list[str]) -> int:
     parsed = parse_docker_args(args)
     image = docker_image_name()
+    ensure_docker_available()
     ensure_docker_image(image)
 
     input_path = parsed["input"].expanduser().resolve()
@@ -247,7 +262,12 @@ def run_in_docker(args: list[str]) -> int:
 
     print(f"[+] Docker image: {image}")
     print("[+] Running isolated container analysis")
-    return subprocess.run(command).returncode
+    result = subprocess.run(command)
+    if result.returncode == 125:
+        print("[-] Docker could not start the analysis container. Check Docker daemon status, image name, and mount permissions.", file=sys.stderr)
+    elif result.returncode != 0:
+        print(f"[-] Analysis container exited with code {result.returncode}", file=sys.stderr)
+    return result.returncode
 
 
 def parse_docker_args(args: list[str]) -> dict:
@@ -293,8 +313,7 @@ def update_docker_image() -> int:
 
 
 def pull_docker_image(image: str) -> None:
-    if not which("docker"):
-        raise DecompileError("Docker is not installed")
+    ensure_docker_available()
 
     result = run(["docker", "pull", image], check=False)
     if result.returncode == 0:
@@ -306,11 +325,29 @@ def pull_docker_image(image: str) -> None:
             f"could not pull Docker image: {image}. "
             f"For local development, build it with: docker build -t {image} ."
         )
-    raise DecompileError(f"could not pull Docker image: {image}")
+    raise DecompileError(
+        f"could not pull Docker image: {image}. Check network access, image name, and Docker registry credentials."
+    )
 
 
 def docker_image_name() -> str:
     return os.environ.get("DECOMPILE_DOCKER_IMAGE", DEFAULT_DOCKER_IMAGE)
+
+
+def ensure_docker_available() -> None:
+    if not which("docker"):
+        raise DecompileError(
+            "Docker CLI not found. Install Docker Engine/Desktop and make sure 'docker' is in PATH. "
+            "Use --local only when all reverse-engineering tools are installed on the host."
+        )
+
+    result = subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        detail = compact_error(result.stderr)
+        raise DecompileError(
+            "Docker is installed but the daemon is not reachable. Start Docker and verify with 'docker info'."
+            + (f" Details: {detail}" if detail else "")
+        )
 
 
 def print_usage() -> None:
@@ -320,6 +357,7 @@ def print_usage() -> None:
   decompile --local <file-or-bundle> [output-dir]
   decompile --no-ai <file-or-bundle> [output-dir]
   decompile --update [--image <image>]
+  decompile doctor [--image <image>]
   decompile --image <image> <file-or-bundle> [output-dir]
   decompile --type <native|apk|aab|dex|jar|class|dotnet|ipa|app-bundle> <file> [output-dir]
 
@@ -342,6 +380,77 @@ Environment:
   DECOMPILE_COPILOT_MODEL     optional Copilot model for enhanced.c
   DECOMPILE_COPILOT_EFFORT    low, medium, high, xhigh; default high"""
     )
+
+
+def run_doctor(options: CliOptions) -> int:
+    checks: list[tuple[str, str, str]] = []
+
+    def add(status: str, name: str, detail: str) -> None:
+        checks.append((status, name, detail))
+
+    add("OK", "python", sys.version.split()[0])
+
+    docker = which("docker")
+    if docker:
+        version = subprocess.run(["docker", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        add("OK" if version.returncode == 0 else "WARN", "docker cli", version.stdout.strip() or compact_error(version.stderr))
+        info_result = subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if info_result.returncode == 0:
+            add("OK", "docker daemon", "reachable")
+            image = docker_image_name()
+            inspect = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if inspect.returncode == 0:
+                add("OK", "docker image", image)
+            else:
+                add("WARN", "docker image", f"{image} missing; first run or decompile --update will pull it")
+        else:
+            add("FAIL", "docker daemon", compact_error(info_result.stderr) or "not reachable")
+    else:
+        add("FAIL", "docker cli", "not installed; Docker is required unless using --local with host tools")
+
+    root_dir = Path(__file__).resolve().parent
+    dirs = resource_dirs(root_dir)
+    for resource in ["DumpAllDecompile.java", "enhance_with_copilot"]:
+        found = next((directory / resource for directory in dirs if (directory / resource).exists()), None)
+        if found:
+            executable_note = ""
+            if resource == "enhance_with_copilot" and not os.access(found, os.X_OK):
+                add("FAIL", resource, f"{found} exists but is not executable")
+                continue
+            add("OK", resource, str(found) + executable_note)
+        else:
+            add("FAIL", resource, "not found")
+
+    analyze = None
+    try:
+        analyze = find_analyze_headless()
+    except DecompileError as exc:
+        add("WARN", "analyzeHeadless", str(exc))
+    if analyze:
+        add("OK", "analyzeHeadless", str(analyze))
+
+    for tool in ["jadx", "apktool", "ilspycmd", "objdump", "readelf", "nm", "file", "gcc", "jq"]:
+        path = which(tool)
+        add("OK" if path else "WARN", tool, path or "missing; needed only for related input types")
+
+    gh = which("gh")
+    if gh:
+        add("OK", "gh", gh)
+        if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+            add("OK", "github auth", "GH_TOKEN/GITHUB_TOKEN is set")
+        else:
+            auth = subprocess.run(["gh", "auth", "status"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            detail = compact_error(auth.stdout + "\n" + auth.stderr)
+            add("OK" if auth.returncode == 0 else "WARN", "github auth", detail or "not authenticated; AI enhancement may fail")
+    else:
+        add("WARN", "gh", "missing; AI enhancement requires GitHub CLI")
+
+    print("decompile doctor")
+    print("=" * 80)
+    for status, name, detail in checks:
+        print(f"{status:<5} {name:<22} {detail}")
+
+    return 1 if any(status == "FAIL" for status, _, _ in checks) else 0
 
 
 def sanitize_name(name: str) -> str:
@@ -411,6 +520,280 @@ def run(
     if check and result.returncode != 0:
         raise DecompileError(f"command failed ({result.returncode}): {display}")
     return result
+
+
+def capture_tool(ctx: Context, name: str, cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess | None:
+    if not cmd or not which(cmd[0]):
+        ctx.tool_statuses.append({"name": name, "status": "missing", "command": cmd[0] if cmd else ""})
+        return None
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+        record_tool(ctx, name, result)
+        return result
+    except subprocess.TimeoutExpired:
+        ctx.tool_statuses.append({"name": name, "status": "timeout", "command": " ".join(cmd), "timeout": timeout})
+        return None
+
+
+def record_tool(ctx: Context, name: str, result: subprocess.CompletedProcess) -> None:
+    entry: dict[str, object] = {
+        "name": name,
+        "status": "ok" if result.returncode == 0 else "failed",
+        "exit_code": result.returncode,
+    }
+    args = getattr(result, "args", None)
+    if args:
+        entry["command"] = " ".join(str(part) for part in args) if isinstance(args, list) else str(args)
+    stderr = getattr(result, "stderr", None)
+    if isinstance(stderr, str) and stderr.strip():
+        entry["stderr"] = compact_error(stderr)
+    ctx.tool_statuses.append(entry)
+
+
+def compact_error(text: str, limit: int = 240) -> str:
+    cleaned = " ".join(text.strip().split())
+    if len(cleaned) > limit:
+        return cleaned[: limit - 3] + "..."
+    return cleaned
+
+
+def summary_path(ctx: Context) -> Path:
+    return ctx.output_dir / "summary.txt"
+
+
+def metadata_path(ctx: Context) -> Path:
+    return ctx.output_dir / "metadata.json"
+
+
+def initialize_metadata(ctx: Context, kind: str) -> None:
+    ctx.metadata = {
+        "tool": APP_NAME,
+        "schema": 1,
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "input": {
+            "path": str(ctx.input_path),
+            "name": ctx.input_path.name,
+            "kind": kind,
+        },
+        "analysis": {
+            "output_dir": str(ctx.output_dir),
+            "base_name": ctx.base_name,
+            "timeout_seconds": ctx.timeout,
+            "ai_enabled": os.environ.get("DECOMPILE_NO_AI") != "1",
+        },
+    }
+
+    if ctx.input_path.is_file():
+        size, sha256, entropy = file_size_hash_entropy(ctx.input_path)
+        ctx.metadata["input"].update({"size": size, "sha256": sha256, "entropy": entropy})
+        collect_static_metadata(ctx)
+
+
+def collect_static_metadata(ctx: Context) -> None:
+    binary = ctx.input_path
+    kind = str(ctx.metadata.get("input", {}).get("kind", ""))
+    file_result = capture_tool(ctx, "file", ["file", "-b", str(binary)])
+    file_description = file_result.stdout.strip() if file_result and file_result.returncode == 0 else ""
+
+    native_metadata = kind in NATIVE_KINDS or kind in DOTNET_KINDS
+    if native_metadata:
+        objdump_file = capture_tool(ctx, "objdump-file", ["objdump", "-f", str(binary)])
+        objdump_header = objdump_file.stdout if objdump_file and objdump_file.returncode == 0 else ""
+        ctx.metadata["architecture"] = parse_architecture(file_description, objdump_header)
+        ctx.metadata["sections"] = collect_sections(ctx, binary)
+        ctx.metadata["imports"] = collect_imports(ctx, binary)
+        ctx.metadata["symbols"] = collect_symbols(ctx, binary)
+    else:
+        ctx.metadata["architecture"] = parse_architecture(file_description, "")
+        ctx.metadata["sections"] = []
+        ctx.metadata["imports"] = {"count": 0, "items": [], "truncated": False}
+        ctx.metadata["symbols"] = {"count": 0, "items": [], "truncated": False}
+
+    ctx.metadata["strings"] = extract_ascii_strings(binary)
+
+
+def file_size_hash_entropy(path: Path) -> tuple[int, str, float]:
+    sha256 = hashlib.sha256()
+    counts = [0] * 256
+    size = 0
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            sha256.update(chunk)
+            size += len(chunk)
+            for byte in chunk:
+                counts[byte] += 1
+
+    if size == 0:
+        return 0, sha256.hexdigest(), 0.0
+
+    entropy = 0.0
+    for count in counts:
+        if count:
+            probability = count / size
+            entropy -= probability * math.log2(probability)
+    return size, sha256.hexdigest(), round(entropy, 4)
+
+
+def parse_architecture(file_description: str, objdump_header: str) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if file_description:
+        data["file"] = file_description
+    match = re.search(r"architecture:\s*([^,\n]+)", objdump_header)
+    if match:
+        data["objdump"] = match.group(1).strip()
+    match = re.search(r"file format\s+(\S+)", objdump_header)
+    if match:
+        data["format"] = match.group(1).strip()
+    return data
+
+
+def collect_sections(ctx: Context, binary: Path) -> list[dict[str, object]]:
+    result = capture_tool(ctx, "objdump-sections", ["objdump", "-h", str(binary)])
+    if not result or result.returncode != 0:
+        return []
+
+    sections = []
+    section_re = re.compile(
+        r"^\s*(\d+)\s+(\S+)\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)\s+(.+)$"
+    )
+    for line in result.stdout.splitlines():
+        match = section_re.match(line)
+        if not match:
+            continue
+        index, name, size, vma, lma, file_offset, align = match.groups()
+        sections.append(
+            {
+                "index": int(index),
+                "name": name,
+                "size": int(size, 16),
+                "vma": "0x" + vma,
+                "lma": "0x" + lma,
+                "file_offset": "0x" + file_offset,
+                "alignment": align.strip(),
+            }
+        )
+    return sections
+
+
+def collect_imports(ctx: Context, binary: Path) -> dict[str, object]:
+    imports: dict[str, object] = {"count": 0, "items": []}
+    items: list[str] = []
+
+    readelf = which("readelf")
+    if readelf:
+        result = capture_tool(ctx, "readelf-symbols", [readelf, "-Ws", str(binary)])
+        if result and result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if " UND " not in line:
+                    continue
+                name_part = line.split(" UND ", 1)[1].strip().split()
+                if name_part:
+                    name = name_part[0].split("@", 1)[0]
+                    if name and name not in {"UND", "0"}:
+                        items.append(name)
+
+    objdump = which("objdump")
+    if objdump:
+        result = capture_tool(ctx, "objdump-private-headers", [objdump, "-p", str(binary)])
+        if result and result.returncode == 0:
+            current_dll = None
+            for line in result.stdout.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("DLL Name:"):
+                    current_dll = stripped.split(":", 1)[1].strip()
+                    items.append(current_dll)
+                elif current_dll and re.match(r"^[0-9a-fA-F]+\s+[0-9]+\s+\S+", stripped):
+                    items.append(f"{current_dll}:{stripped.split()[-1]}")
+
+    unique = sorted(set(items))
+    imports["count"] = len(unique)
+    imports["items"] = unique[:200]
+    imports["truncated"] = len(unique) > 200
+    return imports
+
+
+def collect_symbols(ctx: Context, binary: Path) -> dict[str, object]:
+    symbols: list[str] = []
+    readelf = which("readelf")
+    if readelf:
+        result = capture_tool(ctx, "readelf-defined-symbols", [readelf, "-Ws", str(binary)])
+        if result and result.returncode == 0:
+            for line in result.stdout.splitlines():
+                match = re.match(r"\s*\d+:\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)\s*(.*)$", line)
+                if not match:
+                    continue
+                ndx, rest = match.groups()
+                if ndx == "UND":
+                    continue
+                fields = rest.split()
+                if fields:
+                    symbols.append(fields[0].split("@", 1)[0])
+
+    nm = which("nm")
+    if nm and not symbols:
+        result = capture_tool(ctx, "nm-symbols", [nm, "-an", str(binary)])
+        if result and result.returncode == 0:
+            symbols.extend(parse_symbol_lines(result.stdout))
+
+    if not symbols:
+        objdump = which("objdump")
+        if objdump:
+            result = capture_tool(ctx, "objdump-symbols", [objdump, "-t", str(binary)])
+            if result and result.returncode == 0:
+                symbols.extend(parse_symbol_lines(result.stdout))
+
+    unique = sorted(set(symbols))
+    return {"count": len(unique), "items": unique[:200], "truncated": len(unique) > 200}
+
+
+def parse_symbol_lines(text: str) -> list[str]:
+    symbols = []
+    for line in text.splitlines():
+        if "SYMBOL TABLE" in line or "no symbols" in line or "file format" in line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[-1]
+        if not name or name in {"*ABS*", "*UND*", ".text", ".data", ".bss"}:
+            continue
+        if re.fullmatch(r"[0-9A-Fa-f]+", name):
+            continue
+        symbols.append(name)
+    return symbols
+
+
+def extract_ascii_strings(path: Path, min_length: int = 4, limit: int = 200, max_scan: int = 50 * 1024 * 1024) -> dict[str, object]:
+    sample = []
+    count = 0
+    current = bytearray()
+    scanned = 0
+
+    def flush() -> None:
+        nonlocal count, current
+        if len(current) >= min_length:
+            count += 1
+            if len(sample) < limit:
+                sample.append(current.decode("ascii", errors="replace"))
+        current = bytearray()
+
+    with path.open("rb") as fh:
+        while scanned < max_scan:
+            chunk = fh.read(min(1024 * 1024, max_scan - scanned))
+            if not chunk:
+                break
+            scanned += len(chunk)
+            for byte in chunk:
+                if 32 <= byte <= 126:
+                    current.append(byte)
+                else:
+                    flush()
+        flush()
+
+    return {"count": count, "items": sample, "truncated": len(sample) < count or path.stat().st_size > scanned}
 
 
 def isolated_tool_env(home: Path) -> dict[str, str]:
@@ -536,7 +919,7 @@ def reverse_native(ctx: Context, binary: Path, output_base: str) -> None:
     try:
         print(f"[+] Analyzer   : {analyze}")
         with tempfile.TemporaryDirectory(prefix="decompile-home.") as home:
-            run(
+            result = run(
                 [
                     str(analyze),
                     str(project_dir),
@@ -554,6 +937,7 @@ def reverse_native(ctx: Context, binary: Path, output_base: str) -> None:
                 ],
                 env=isolated_tool_env(Path(home)),
             )
+            record_tool(ctx, "ghidra", result)
     finally:
         shutil.rmtree(project_dir, ignore_errors=True)
 
@@ -563,22 +947,22 @@ def reverse_native(ctx: Context, binary: Path, output_base: str) -> None:
 
     objdump_path = ctx.output_dir / f"{output_base}.objdump.txt"
     objdump_err = ctx.output_dir / f"{output_base}.objdump.err"
-    generate_objdump(binary, objdump_path, objdump_err)
+    result = generate_objdump(binary, objdump_path, objdump_err)
+    if result:
+        record_tool(ctx, "objdump", result)
     run_enhancer(ctx, binary, output_base)
 
     require_file(ctx.output_dir / f"{output_base}.enhanced.c")
-    if not ctx.keep_debug:
-        safe_unlink(objdump_path)
-        safe_unlink(objdump_err)
+    canonicalize_native_outputs(ctx, output_base)
 
 
-def generate_objdump(binary: Path, output: Path, error_output: Path) -> None:
+def generate_objdump(binary: Path, output: Path, error_output: Path) -> subprocess.CompletedProcess | None:
     objdump = which("objdump")
     if not objdump:
         output.write_text("objdump not found\n")
-        return
+        return None
     with output.open("wb") as stdout, error_output.open("wb") as stderr:
-        subprocess.run([objdump, "-d", "-Mintel", "-s", str(binary)], stdout=stdout, stderr=stderr, check=False)
+        return subprocess.run([objdump, "-d", "-Mintel", "-s", str(binary)], stdout=stdout, stderr=stderr, check=False)
 
 
 def run_enhancer(ctx: Context, binary: Path, output_base: str) -> None:
@@ -589,16 +973,18 @@ def run_enhancer(ctx: Context, binary: Path, output_base: str) -> None:
         print("[+] DECOMPILE_NO_AI=1; using raw pseudocode as enhanced.c fallback")
         enhanced.write_text(pseudocode.read_text(errors="replace"), errors="replace")
         append_summary(ctx.output_dir / f"{output_base}.summary.txt", f"Enhanced file          : {enhanced}")
+        ctx.tool_statuses.append({"name": "enhancer", "status": "skipped", "reason": "DECOMPILE_NO_AI=1"})
         return
 
     enhancer = find_resource(ctx, "enhance_with_copilot")
     if not os.access(enhancer, os.X_OK):
         raise DecompileError(f"enhancer is not executable: {enhancer}")
-    run([str(enhancer), str(binary), str(ctx.output_dir), output_base])
+    result = run([str(enhancer), str(binary), str(ctx.output_dir), output_base])
+    record_tool(ctx, "enhancer", result)
 
 
 def reverse_android(ctx: Context, kind: str) -> None:
-    summary = ctx.output_dir / f"{ctx.base_name}.summary.txt"
+    summary = summary_path(ctx)
     write_summary_header(summary, ctx, kind)
 
     source_dir = ctx.output_dir / "source"
@@ -613,6 +999,7 @@ def reverse_android(ctx: Context, kind: str) -> None:
                 args.extend(extra.split())
             args.append(str(ctx.input_path))
             result = run(args, check=False, env=tool_env)
+            record_tool(ctx, "jadx", result)
             append_summary(summary, f"JADX exit code       : {result.returncode}")
         else:
             append_summary(summary, "JADX               : missing; install jadx for Android/Java source output")
@@ -623,6 +1010,7 @@ def reverse_android(ctx: Context, kind: str) -> None:
                 resources_dir = ctx.output_dir / "resources"
                 with tempfile.TemporaryDirectory(prefix="apktool-framework.") as frame_dir:
                     result = run([apktool, "d", "-f", "-p", frame_dir, "-o", str(resources_dir), str(ctx.input_path)], check=False, env=tool_env)
+                record_tool(ctx, "apktool", result)
                 append_summary(summary, f"apktool exit code    : {result.returncode}")
             else:
                 append_summary(summary, "apktool            : missing; resources were not decoded")
@@ -631,7 +1019,7 @@ def reverse_android(ctx: Context, kind: str) -> None:
 
 
 def reverse_java(ctx: Context, kind: str) -> None:
-    summary = ctx.output_dir / f"{ctx.base_name}.summary.txt"
+    summary = summary_path(ctx)
     write_summary_header(summary, ctx, kind)
 
     source_dir = ctx.output_dir / "source"
@@ -643,6 +1031,7 @@ def reverse_java(ctx: Context, kind: str) -> None:
 
     with tempfile.TemporaryDirectory(prefix="decompile-home.") as home:
         result = run([jadx, "-d", str(source_dir), str(ctx.input_path)], check=False, env=isolated_tool_env(Path(home)))
+    record_tool(ctx, "jadx", result)
     append_summary(summary, f"JADX exit code       : {result.returncode}")
     write_android_summary(summary, ctx, source_dir)
 
@@ -652,24 +1041,25 @@ def reverse_dotnet(ctx: Context) -> None:
     if not ilspy:
         print("[!] Detected .NET metadata, but ilspycmd is not installed; falling back to Ghidra PE analysis.")
         reverse_native(ctx, ctx.input_path, ctx.base_name)
-        summary = ctx.output_dir / f"{ctx.base_name}.summary.txt"
+        summary = summary_path(ctx)
         append_summary(summary, "Detected .NET       : yes")
         append_summary(summary, "ilspycmd            : missing; used native fallback")
         return
 
-    summary = ctx.output_dir / f"{ctx.base_name}.summary.txt"
+    summary = summary_path(ctx)
     write_summary_header(summary, ctx, "dotnet")
     source_dir = ctx.output_dir / "source"
     source_dir.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="decompile-home.") as home:
         result = run([ilspy, "-p", "-o", str(source_dir), str(ctx.input_path)], check=False, env=isolated_tool_env(Path(home)))
+    record_tool(ctx, "ilspycmd", result)
     append_summary(summary, f"ilspycmd exit code  : {result.returncode}")
     append_summary(summary, f"C# source directory : {source_dir}")
     append_summary(summary, f"C# files            : {count_files(source_dir, {'.cs'})}")
 
 
 def reverse_ipa(ctx: Context) -> None:
-    summary = ctx.output_dir / f"{ctx.base_name}.summary.txt"
+    summary = summary_path(ctx)
     with tempfile.TemporaryDirectory(prefix="decompile-ipa.") as tmp:
         tmp_path = Path(tmp)
         executable, app_name, info = extract_ipa_executable(ctx.input_path, tmp_path)
@@ -694,7 +1084,7 @@ def reverse_app_bundle(ctx: Context) -> None:
         with (ios_dir / "Info.plist").open("wb") as fh:
             plistlib.dump(info, fh)
     reverse_native(ctx, executable, ctx.base_name)
-    append_summary(ctx.output_dir / f"{ctx.base_name}.summary.txt", f"App executable       : {executable}")
+    append_summary(summary_path(ctx), f"App executable       : {executable}")
 
 
 def extract_ipa_executable(ipa: Path, tmp_path: Path) -> tuple[Path, str, dict | None]:
@@ -811,12 +1201,177 @@ def safe_unlink(path: Path) -> None:
         pass
 
 
+def move_generated_file(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    src.replace(dst)
+
+
+def canonicalize_native_outputs(ctx: Context, output_base: str) -> None:
+    move_generated_file(ctx.output_dir / f"{output_base}.pseudocode.c", ctx.output_dir / "pseudocode.c")
+    move_generated_file(ctx.output_dir / f"{output_base}.disassembly.asm", ctx.output_dir / "disassembly.asm")
+    move_generated_file(ctx.output_dir / f"{output_base}.enhanced.c", ctx.output_dir / "enhanced.c")
+    move_generated_file(ctx.output_dir / f"{output_base}.summary.txt", summary_path(ctx))
+
+    debug_files = {
+        f"{output_base}.objdump.txt": "objdump.txt",
+        f"{output_base}.objdump.err": "objdump.err",
+        f"{output_base}.enhanced.raw.jsonl": "enhanced.raw.jsonl",
+        f"{output_base}.enhanced.response.txt": "enhanced.response.txt",
+        f"{output_base}.enhanced.syntax.log": "enhanced.syntax.log",
+        f"{output_base}.enhance.prompt.txt": "enhance.prompt.txt",
+        f"{output_base}.enhance.fix.prompt.txt": "enhance.fix.prompt.txt",
+        f"{output_base}.enhanced.fix.raw.jsonl": "enhanced.fix.raw.jsonl",
+        f"{output_base}.enhanced.fix.response.txt": "enhanced.fix.response.txt",
+    }
+
+    if ctx.keep_debug:
+        debug_dir = ctx.output_dir / "debug"
+        for source_name, target_name in debug_files.items():
+            move_generated_file(ctx.output_dir / source_name, debug_dir / target_name)
+    else:
+        for source_name in debug_files:
+            safe_unlink(ctx.output_dir / source_name)
+
+    for leftover in ctx.output_dir.glob(f"{output_base}.*"):
+        if leftover.is_file():
+            safe_unlink(leftover)
+
+
+def finalize_outputs(ctx: Context, kind: str) -> None:
+    summary = summary_path(ctx)
+    existing_summary = summary.read_text(encoding="utf-8", errors="replace") if summary.exists() else ""
+    write_final_summary(ctx, kind, existing_summary)
+    ctx.metadata["tool_statuses"] = ctx.tool_statuses
+    ctx.metadata["outputs"] = output_manifest(ctx)
+    metadata_path(ctx).write_text(json.dumps(ctx.metadata, indent=2, sort_keys=True), encoding="utf-8")
+    ctx.metadata["outputs"] = output_manifest(ctx)
+    metadata_path(ctx).write_text(json.dumps(ctx.metadata, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def output_manifest(ctx: Context) -> list[dict[str, object]]:
+    outputs = []
+    if not ctx.output_dir.exists():
+        return outputs
+    for child in sorted(ctx.output_dir.iterdir()):
+        if child.is_file():
+            outputs.append({"path": child.name, "type": "file", "size": child.stat().st_size})
+        elif child.is_dir():
+            outputs.append({"path": child.name + "/", "type": "directory", "files": count_all_files(child)})
+    return outputs
+
+
+def count_all_files(root: Path) -> int:
+    if not root.exists():
+        return 0
+    return sum(1 for path in root.rglob("*") if path.is_file())
+
+
+def write_final_summary(ctx: Context, kind: str, existing_summary: str) -> None:
+    input_info = ctx.metadata.get("input", {})
+    architecture = ctx.metadata.get("architecture", {})
+    sections = ctx.metadata.get("sections", [])
+    imports = ctx.metadata.get("imports", {})
+    symbols = ctx.metadata.get("symbols", {})
+    strings = ctx.metadata.get("strings", {})
+
+    lines = [
+        "DECOMPILE SUMMARY",
+        "=" * 80,
+        f"Input              : {ctx.input_path}",
+        f"Type               : {kind}",
+        f"Output dir         : {ctx.output_dir}",
+    ]
+
+    if isinstance(input_info, dict):
+        if "size" in input_info:
+            lines.append(f"Size               : {input_info['size']} bytes")
+        if "sha256" in input_info:
+            lines.append(f"SHA256             : {input_info['sha256']}")
+        if "entropy" in input_info:
+            lines.append(f"Entropy            : {input_info['entropy']} bits/byte")
+
+    if isinstance(architecture, dict) and architecture:
+        if architecture.get("file"):
+            lines.append(f"File type          : {architecture['file']}")
+        if architecture.get("objdump"):
+            lines.append(f"Architecture       : {architecture['objdump']}")
+        if architecture.get("format"):
+            lines.append(f"Object format      : {architecture['format']}")
+
+    lines.extend(
+        [
+            "",
+            "OUTPUTS",
+            "-" * 80,
+        ]
+    )
+    for item in output_manifest(ctx):
+        if item["type"] == "file":
+            lines.append(f"{item['path']:<24} file      {item['size']} bytes")
+        else:
+            lines.append(f"{item['path']:<24} directory {item['files']} files")
+
+    lines.extend(["", "TOOL STATUS", "-" * 80])
+    if ctx.tool_statuses:
+        for entry in ctx.tool_statuses:
+            status = entry.get("status", "unknown")
+            detail = f"exit={entry.get('exit_code')}" if "exit_code" in entry else str(entry.get("reason", ""))
+            lines.append(f"{entry.get('name', 'tool'):<24} {status:<8} {detail}")
+    else:
+        lines.append("No external tool status recorded.")
+
+    lines.extend(["", "SECTIONS", "-" * 80])
+    if isinstance(sections, list) and sections:
+        for section in sections[:80]:
+            if not isinstance(section, dict):
+                continue
+            lines.append(
+                f"{section.get('name', ''):<20} size={section.get('size', ''):<10} "
+                f"vma={section.get('vma', ''):<14} file_offset={section.get('file_offset', '')}"
+            )
+        if len(sections) > 80:
+            lines.append(f"... {len(sections) - 80} more sections")
+    else:
+        lines.append("No section table available.")
+
+    append_counted_items(lines, "IMPORTS", imports)
+    append_counted_items(lines, "SYMBOLS", symbols)
+    append_counted_items(lines, "STRINGS", strings)
+
+    cleaned_existing = existing_summary.strip()
+    if cleaned_existing:
+        lines.extend(["", "DECOMPILER DETAILS", "-" * 80, cleaned_existing])
+
+    summary_path(ctx).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def append_counted_items(lines: list[str], title: str, data: object) -> None:
+    lines.extend(["", title, "-" * 80])
+    if not isinstance(data, dict):
+        lines.append("Not available.")
+        return
+    count = data.get("count", 0)
+    lines.append(f"Count: {count}")
+    items = data.get("items", [])
+    if isinstance(items, list) and items:
+        for item in items[:80]:
+            lines.append(f"  {item}")
+        if data.get("truncated") or len(items) > 80:
+            lines.append("  ... truncated")
+    else:
+        lines.append("  none")
+
+
 def print_outputs(ctx: Context) -> None:
     print("[+] Done")
     for path in sorted(ctx.output_dir.iterdir()):
-        if path.is_file() and path.suffix in {".asm", ".c", ".txt"}:
+        if path.is_file() and path.name in {"summary.txt", "metadata.json", "disassembly.asm", "pseudocode.c", "enhanced.c"}:
             print(f"[+] Output     : {path}")
-        elif path.is_dir() and path.name in {"source", "resources", "ios", "app"}:
+        elif path.is_dir() and path.name in {"source", "resources", "ios", "app", "debug"}:
             print(f"[+] Output     : {path}/")
 
 
