@@ -24,14 +24,7 @@ APP_NAME = "decompile"
 DEFAULT_SUFFIX = ".ghidra-out"
 DEFAULT_DOCKER_IMAGE = "docker.io/admin12121/decompile:stable"
 DOCKER_PASSTHROUGH_ENV = {
-    "DECOMPILE_NO_AI",
-    "DECOMPILE_KEEP_DEBUG",
-    "DECOMPILE_KEEP_COPILOT_DEBUG",
-    "DECOMPILE_COPILOT_MODEL",
-    "DECOMPILE_COPILOT_EFFORT",
     "GHIDRA_TIMEOUT",
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
 }
 NATIVE_KINDS = {"native", "elf", "pe", "macho", "native-unknown"}
 ANDROID_KINDS = {"apk", "aab", "dex"}
@@ -215,6 +208,8 @@ def run_in_docker(args: list[str]) -> int:
     image = docker_image_name()
     ensure_docker_available()
     ensure_docker_image(image)
+    host_ai_enabled = os.environ.get("DECOMPILE_NO_AI") != "1"
+    keep_debug = os.environ.get("DECOMPILE_KEEP_DEBUG") == "1" or os.environ.get("DECOMPILE_KEEP_COPILOT_DEBUG") == "1"
 
     input_path = parsed["input"].expanduser().resolve()
     output_dir = parsed["output"].expanduser().resolve()
@@ -235,21 +230,21 @@ def run_in_docker(args: list[str]) -> int:
         "--cap-drop=ALL",
         "--security-opt",
         "no-new-privileges",
+        "--network",
+        "none",
     ]
-    if os.environ.get("DECOMPILE_NO_AI") == "1":
-        command.extend(["--network", "none"])
 
     command.extend([
         "--user", f"{os.getuid()}:{os.getgid()}",
         "-e", "DECOMPILE_IN_DOCKER=1",
         "-e", "HOME=/tmp/decompile-home",
+        "-e", "DECOMPILE_NO_AI=1",
         "-v", f"{input_mount}:/input:ro",
         "-v", f"{output_dir}:/out",
     ])
 
-    gh_config = Path.home() / ".config" / "gh"
-    if gh_config.exists():
-        command.extend(["-v", f"{gh_config}:/tmp/decompile-home/.config/gh:ro"])
+    if host_ai_enabled or keep_debug:
+        command.extend(["-e", "DECOMPILE_KEEP_DEBUG=1"])
 
     for name in sorted(DOCKER_PASSTHROUGH_ENV):
         if name in os.environ:
@@ -265,9 +260,17 @@ def run_in_docker(args: list[str]) -> int:
     result = subprocess.run(command)
     if result.returncode == 125:
         print("[-] Docker could not start the analysis container. Check Docker daemon status, image name, and mount permissions.", file=sys.stderr)
+        return result.returncode
     elif result.returncode != 0:
         print(f"[-] Analysis container exited with code {result.returncode}", file=sys.stderr)
-    return result.returncode
+        return result.returncode
+
+    normalize_docker_reports(output_dir, input_path)
+
+    if host_ai_enabled:
+        return run_host_ai_enhancement(input_path, output_dir, sanitize_name(input_path.name), keep_debug)
+
+    return 0
 
 
 def parse_docker_args(args: list[str]) -> dict:
@@ -332,6 +335,257 @@ def pull_docker_image(image: str) -> None:
 
 def docker_image_name() -> str:
     return os.environ.get("DECOMPILE_DOCKER_IMAGE", DEFAULT_DOCKER_IMAGE)
+
+
+def normalize_docker_reports(output_dir: Path, input_path: Path) -> None:
+    container_input = str(Path("/input") / input_path.name)
+    replacements = {
+        container_input: str(input_path),
+        "/out": str(output_dir),
+    }
+
+    summary = output_dir / "summary.txt"
+    if summary.exists():
+        text = summary.read_text(encoding="utf-8", errors="replace")
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        summary.write_text(text, encoding="utf-8")
+
+    metadata = output_dir / "metadata.json"
+    if metadata.exists():
+        try:
+            data = json.loads(metadata.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            input_data = data.setdefault("input", {})
+            if isinstance(input_data, dict):
+                input_data["path"] = str(input_path)
+            analysis = data.setdefault("analysis", {})
+            if isinstance(analysis, dict):
+                analysis["output_dir"] = str(output_dir)
+            data["outputs"] = build_output_manifest(output_dir)
+            metadata.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+    sync_output_reports(output_dir)
+
+
+def find_resource_path(name: str, dirs: list[Path]) -> Path:
+    env_path = os.environ.get("GHIDRA_SCRIPT_PATH")
+    search_dirs = [Path(env_path)] if env_path else []
+    search_dirs.extend(dirs)
+    for directory in search_dirs:
+        candidate = directory / name
+        if candidate.exists():
+            return candidate
+    raise DecompileError(f"required resource not found: {name}")
+
+
+def run_host_ai_enhancement(input_path: Path, output_dir: Path, base_name: str, keep_debug: bool) -> int:
+    if not (output_dir / "pseudocode.c").is_file():
+        print("[+] No native pseudocode output found; skipping host AI enhancement")
+        return 0
+
+    try:
+        for tool in ["gh", "jq"]:
+            if not which(tool):
+                raise DecompileError(
+                    f"AI enhancement runs on the host, but '{tool}' is not installed. "
+                    "Install GitHub CLI/Copilot tools or rerun with --no-ai."
+                )
+
+        copilot = subprocess.run(["gh", "copilot", "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if copilot.returncode != 0:
+            raise DecompileError(
+                "AI enhancement runs on the host, but 'gh copilot' is not available. "
+                "Install/enable GitHub Copilot CLI or rerun with --no-ai."
+            )
+
+        root_dir = Path(__file__).resolve().parent
+        enhancer = find_resource_path("enhance_with_copilot", resource_dirs(root_dir))
+        if not os.access(enhancer, os.X_OK):
+            raise DecompileError(f"host enhancer is not executable: {enhancer}")
+
+        debug_dir = output_dir / "debug"
+        objdump = debug_dir / "objdump.txt"
+        if not objdump.is_file():
+            raise DecompileError(
+                "host AI enhancement needs debug/objdump.txt from the extraction container. "
+                "Rerun without deleting the output directory, or use --no-ai."
+            )
+
+        legacy_files = {
+            output_dir / "pseudocode.c": output_dir / f"{base_name}.pseudocode.c",
+            output_dir / "disassembly.asm": output_dir / f"{base_name}.disassembly.asm",
+            output_dir / "summary.txt": output_dir / f"{base_name}.summary.txt",
+            objdump: output_dir / f"{base_name}.objdump.txt",
+        }
+        objdump_err = debug_dir / "objdump.err"
+        if objdump_err.exists():
+            legacy_files[objdump_err] = output_dir / f"{base_name}.objdump.err"
+
+        for source, target in legacy_files.items():
+            if source.exists():
+                shutil.copyfile(source, target)
+
+        env = os.environ.copy()
+        if keep_debug:
+            env["DECOMPILE_KEEP_COPILOT_DEBUG"] = "1"
+        else:
+            env.pop("DECOMPILE_KEEP_COPILOT_DEBUG", None)
+
+        print("[+] Running host AI enhancement with GitHub CLI/Copilot")
+        result = run([str(enhancer), str(input_path), str(output_dir), base_name], check=False, env=env)
+        if result.returncode != 0:
+            raise DecompileError(
+                "host AI enhancement failed. Check 'gh auth status' and GitHub Copilot CLI availability, "
+                "or rerun with --no-ai."
+            )
+
+        enhanced_legacy = output_dir / f"{base_name}.enhanced.c"
+        summary_legacy = output_dir / f"{base_name}.summary.txt"
+        if enhanced_legacy.exists():
+            move_generated_file(enhanced_legacy, output_dir / "enhanced.c")
+        if summary_legacy.exists():
+            move_generated_file(summary_legacy, output_dir / "summary.txt")
+
+        cleanup_host_ai_temp(output_dir, base_name, keep_debug)
+        for _ in range(2):
+            update_metadata_after_host_ai(output_dir)
+            update_summary_after_host_ai(output_dir)
+        update_metadata_after_host_ai(output_dir)
+
+        print("[+] Host AI enhancement complete")
+        return 0
+    except Exception:
+        cleanup_host_ai_temp(output_dir, base_name, keep_debug)
+        sync_output_reports(output_dir)
+        raise
+
+
+def host_ai_debug_files(base_name: str) -> dict[str, str]:
+    return {
+        f"{base_name}.enhanced.raw.jsonl": "enhanced.raw.jsonl",
+        f"{base_name}.enhanced.response.txt": "enhanced.response.txt",
+        f"{base_name}.enhanced.syntax.log": "enhanced.syntax.log",
+        f"{base_name}.enhance.prompt.txt": "enhance.prompt.txt",
+        f"{base_name}.enhance.fix.prompt.txt": "enhance.fix.prompt.txt",
+        f"{base_name}.enhanced.fix.raw.jsonl": "enhanced.fix.raw.jsonl",
+        f"{base_name}.enhanced.fix.response.txt": "enhanced.fix.response.txt",
+    }
+
+
+def cleanup_host_ai_temp(output_dir: Path, base_name: str, keep_debug: bool) -> None:
+    for suffix in [
+        "pseudocode.c",
+        "disassembly.asm",
+        "summary.txt",
+        "objdump.txt",
+        "objdump.err",
+        "enhanced.c",
+    ]:
+        safe_unlink(output_dir / f"{base_name}.{suffix}")
+
+    debug_dir = output_dir / "debug"
+    if keep_debug:
+        debug_dir.mkdir(exist_ok=True)
+        for source_name, target_name in host_ai_debug_files(base_name).items():
+            move_generated_file(output_dir / source_name, debug_dir / target_name)
+    else:
+        for source_name in host_ai_debug_files(base_name):
+            safe_unlink(output_dir / source_name)
+        shutil.rmtree(debug_dir, ignore_errors=True)
+
+
+def sync_output_reports(output_dir: Path) -> None:
+    for _ in range(2):
+        refresh_metadata_outputs(output_dir)
+        refresh_summary_output_section_file(output_dir)
+    refresh_metadata_outputs(output_dir)
+
+
+def refresh_metadata_outputs(output_dir: Path) -> None:
+    path = output_dir / "metadata.json"
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    data["outputs"] = build_output_manifest(output_dir)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def update_summary_after_host_ai(output_dir: Path) -> None:
+    summary = output_dir / "summary.txt"
+    if not summary.exists():
+        return
+    text = summary.read_text(encoding="utf-8", errors="replace")
+    text = re.sub(r"(?m)^Enhanced file\s*:.*\n?", "", text)
+    text = re.sub(r"(?m)^AI runner\s*:.*\n?", "", text)
+    text = re.sub(r"(?m)^enhancer\s+skipped\s+DECOMPILE_NO_AI=1\s*\n?", "", text)
+    text = append_summary_tool_status(text, "host-enhancer            ok       host GitHub CLI/Copilot")
+    text = text.rstrip() + "\n"
+    text += f"Enhanced file      : {output_dir / 'enhanced.c'}\n"
+    text += "AI runner          : host GitHub CLI/Copilot\n"
+    text = refresh_summary_outputs(text, output_dir)
+    summary.write_text(text.rstrip() + "\n", encoding="utf-8")
+
+
+def refresh_summary_outputs(text: str, output_dir: Path) -> str:
+    section = "\n".join(["OUTPUTS", "-" * 80, *format_output_manifest(output_dir)]) + "\n"
+    pattern = r"(?ms)^OUTPUTS\n-{80}\n.*?(?=\n[A-Z][A-Z ]+\n-{80}\n|\Z)"
+    if re.search(pattern, text):
+        return re.sub(pattern, section, text)
+    return text
+
+
+def refresh_summary_output_section_file(output_dir: Path) -> bool:
+    summary = output_dir / "summary.txt"
+    if not summary.exists():
+        return False
+    original = summary.read_text(encoding="utf-8", errors="replace")
+    updated = refresh_summary_outputs(original, output_dir).rstrip() + "\n"
+    if updated == original:
+        return False
+    summary.write_text(updated, encoding="utf-8")
+    return True
+
+
+def append_summary_tool_status(text: str, line: str) -> str:
+    if line in text:
+        return text
+    pattern = r"(?ms)^(TOOL STATUS\n-{80}\n)(.*?)(?=\n[A-Z][A-Z ]+\n-{80}\n|\Z)"
+    match = re.search(pattern, text)
+    if not match:
+        return text
+
+    body = match.group(2).rstrip()
+    if body == "No external tool status recorded.":
+        body = line
+    else:
+        body = body + "\n" + line
+    return text[: match.start()] + match.group(1) + body + text[match.end():]
+
+
+def update_metadata_after_host_ai(output_dir: Path) -> None:
+    path = output_dir / "metadata.json"
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    analysis = data.setdefault("analysis", {})
+    if isinstance(analysis, dict):
+        analysis["ai_runner"] = "host"
+        analysis["ai_enabled"] = True
+    statuses = data.setdefault("tool_statuses", [])
+    if isinstance(statuses, list):
+        if not any(isinstance(item, dict) and item.get("name") == "host-enhancer" for item in statuses):
+            statuses.append({"name": "host-enhancer", "status": "ok"})
+    data["outputs"] = build_output_manifest(output_dir)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def ensure_docker_available() -> None:
@@ -445,6 +699,14 @@ def run_doctor(options: CliOptions) -> int:
     else:
         add("WARN", "gh", "missing; AI enhancement requires GitHub CLI")
 
+    if gh:
+        copilot = subprocess.run(["gh", "copilot", "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        add(
+            "OK" if copilot.returncode == 0 else "WARN",
+            "gh copilot",
+            "available" if copilot.returncode == 0 else "missing/unavailable; AI enhancement will fail unless --no-ai is used",
+        )
+
     print("decompile doctor")
     print("=" * 80)
     for status, name, detail in checks:
@@ -491,14 +753,7 @@ def unique_paths(paths: list[Path]) -> list[Path]:
 
 
 def find_resource(ctx: Context, name: str) -> Path:
-    env_path = os.environ.get("GHIDRA_SCRIPT_PATH")
-    dirs = [Path(env_path)] if env_path else []
-    dirs.extend(ctx.resource_dirs)
-    for directory in dirs:
-        candidate = directory / name
-        if candidate.exists():
-            return candidate
-    raise DecompileError(f"required resource not found: {name}")
+    return find_resource_path(name, ctx.resource_dirs)
 
 
 def which(name: str) -> str | None:
@@ -1246,22 +1501,41 @@ def finalize_outputs(ctx: Context, kind: str) -> None:
     existing_summary = summary.read_text(encoding="utf-8", errors="replace") if summary.exists() else ""
     write_final_summary(ctx, kind, existing_summary)
     ctx.metadata["tool_statuses"] = ctx.tool_statuses
-    ctx.metadata["outputs"] = output_manifest(ctx)
-    metadata_path(ctx).write_text(json.dumps(ctx.metadata, indent=2, sort_keys=True), encoding="utf-8")
+    for _ in range(3):
+        write_metadata(ctx)
+        refresh_summary_output_section_file(ctx.output_dir)
+    write_metadata(ctx)
+
+
+def write_metadata(ctx: Context) -> None:
     ctx.metadata["outputs"] = output_manifest(ctx)
     metadata_path(ctx).write_text(json.dumps(ctx.metadata, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def output_manifest(ctx: Context) -> list[dict[str, object]]:
+    return build_output_manifest(ctx.output_dir)
+
+
+def build_output_manifest(output_dir: Path) -> list[dict[str, object]]:
     outputs = []
-    if not ctx.output_dir.exists():
+    if not output_dir.exists():
         return outputs
-    for child in sorted(ctx.output_dir.iterdir()):
+    for child in sorted(output_dir.iterdir()):
         if child.is_file():
             outputs.append({"path": child.name, "type": "file", "size": child.stat().st_size})
         elif child.is_dir():
             outputs.append({"path": child.name + "/", "type": "directory", "files": count_all_files(child)})
     return outputs
+
+
+def format_output_manifest(output_dir: Path) -> list[str]:
+    lines = []
+    for item in build_output_manifest(output_dir):
+        if item["type"] == "file":
+            lines.append(f"{item['path']:<24} file      {item['size']} bytes")
+        else:
+            lines.append(f"{item['path']:<24} directory {item['files']} files")
+    return lines or ["No outputs created."]
 
 
 def count_all_files(root: Path) -> int:
@@ -1309,11 +1583,7 @@ def write_final_summary(ctx: Context, kind: str, existing_summary: str) -> None:
             "-" * 80,
         ]
     )
-    for item in output_manifest(ctx):
-        if item["type"] == "file":
-            lines.append(f"{item['path']:<24} file      {item['size']} bytes")
-        else:
-            lines.append(f"{item['path']:<24} directory {item['files']} files")
+    lines.extend(format_output_manifest(ctx.output_dir))
 
     lines.extend(["", "TOOL STATUS", "-" * 80])
     if ctx.tool_statuses:

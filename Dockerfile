@@ -22,7 +22,6 @@ RUN apt-get clean && \
       ghidra \
       openjdk-21-jre-headless \
       python3 \
-      jq \
       jadx \
       apktool \
       file \
@@ -36,16 +35,6 @@ RUN apt-get clean && \
       ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-RUN install -d -m 0755 /etc/apt/keyrings && \
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
-    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
-    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' \
-      "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/github-cli.list && \
-    apt-get update --fix-missing && \
-    apt-get install -y --fix-missing --no-install-recommends gh && \
-    rm -rf /var/lib/apt/lists/*
-
 RUN apt-get update --fix-missing && \
     apt-get install -y --fix-missing --no-install-recommends libicu-dev && \
     rm -rf /var/lib/apt/lists/*
@@ -56,6 +45,9 @@ RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh &&
     rm -f /tmp/dotnet-install.sh && \
     DOTNET_CLI_HOME=/tmp/dotnet-home dotnet tool install --tool-path /usr/local/bin ilspycmd --version "$ILSPYCMD_VERSION" && \
     rm -rf /tmp/dotnet-home
+
+ENV DECOMPILE_IN_DOCKER=1
+ENV DECOMPILE_NO_AI=1
 
 RUN mkdir -p /usr/local/share/decompile /tmp/decompile-home/.config && \
     chmod 0777 /tmp/decompile-home /tmp/decompile-home/.config

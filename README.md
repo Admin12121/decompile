@@ -2,7 +2,9 @@
 
 `decompile` is a Docker-first static reverse-engineering CLI.
 
-Install the small host command, run `decompile ./file`, and the heavy tools run inside the Docker image. The host does not need Ghidra, JADX, apktool, ILSpy, or binutils installed.
+Install the small host command, run `decompile ./file`, and the heavy reverse-engineering tools run inside the Docker image. The host does not need Ghidra, JADX, apktool, ILSpy, or binutils installed.
+
+AI enhancement runs on the host after extraction, using your host GitHub CLI/Copilot login. GitHub credentials are not mounted into Docker.
 
 ## Install
 
@@ -111,8 +113,10 @@ Inside Docker:
 - input is mounted read-only
 - output is mounted read-write
 - the container runs as your current UID/GID
+- network is disabled during analysis
+- GitHub/Copilot credentials are not mounted
 - temporary projects and scratch files are removed
-- `--no-ai` disables network access for the analysis container
+- native analysis keeps temporary objdump data only long enough for the host AI phase
 
 ## AI Enhancement
 
@@ -124,13 +128,21 @@ Use this when you want cleaner function names, variables, and reconstructed C-li
 decompile ./file
 ```
 
+This phase runs on the host with:
+
+```text
+gh
+gh copilot
+jq
+```
+
 Disable it for malware, private samples, offline work, or reproducible local-only output:
 
 ```sh
 decompile --no-ai ./file
 ```
 
-When AI is enabled, analysis context may be sent to GitHub Copilot through `gh`. Pass authentication with `GH_TOKEN`, `GITHUB_TOKEN`, or your local GitHub CLI config.
+When AI is enabled, analysis context may be sent to GitHub Copilot through the host `gh` command. The Docker container still runs without network access and without GitHub auth.
 
 ## Options
 
@@ -158,6 +170,8 @@ DECOMPILE_USE_DOCKER=0      run local host tools
 DECOMPILE_NO_AI=1           skip AI enhancement
 DECOMPILE_KEEP_DEBUG=1      keep objdump and prompt/debug files
 GHIDRA_TIMEOUT=120          per-function decompile timeout
+DECOMPILE_COPILOT_MODEL     optional host Copilot model
+DECOMPILE_COPILOT_EFFORT    low, medium, high, xhigh
 ```
 
 ## Limits
