@@ -9,8 +9,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +28,8 @@ DEFAULT_DOCKER_IMAGE = "docker.io/admin12121/decompile:stable"
 DOCKER_PASSTHROUGH_ENV = {
     "GHIDRA_TIMEOUT",
 }
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+ASCII_SPINNER_FRAMES = ["|", "/", "-", "\\"]
 NATIVE_KINDS = {"native", "elf", "pe", "macho", "native-unknown"}
 ANDROID_KINDS = {"apk", "aab", "dex"}
 JAVA_KINDS = {"jar", "class"}
@@ -34,6 +38,168 @@ DOTNET_KINDS = {"dotnet"}
 
 class DecompileError(Exception):
     pass
+
+
+def color_enabled() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def style(text: str, code: str) -> str:
+    if not color_enabled():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def dim(text: str) -> str:
+    return style(text, "2")
+
+
+def green(text: str) -> str:
+    return style(text, "32")
+
+
+def cyan(text: str) -> str:
+    return style(text, "36")
+
+
+def yellow(text: str) -> str:
+    return style(text, "33")
+
+
+def bold(text: str) -> str:
+    return style(text, "1")
+
+
+def symbol(name: str) -> str:
+    symbols = {
+        "ok": "✓",
+        "question": "?",
+        "dot": "•",
+        "folder": "▸",
+    }
+    ascii_symbols = {
+        "ok": "+",
+        "question": "?",
+        "dot": "-",
+        "folder": ">",
+    }
+    if os.environ.get("DECOMPILE_ASCII") == "1":
+        return ascii_symbols.get(name, "")
+    return symbols.get(name, "")
+
+
+def tree_mid() -> str:
+    return "|-" if os.environ.get("DECOMPILE_ASCII") == "1" else "├─"
+
+
+def tree_last() -> str:
+    return "`-" if os.environ.get("DECOMPILE_ASCII") == "1" else "└─"
+
+
+def tree_pipe() -> str:
+    return "|  " if os.environ.get("DECOMPILE_ASCII") == "1" else "│  "
+
+
+def spinner_frames() -> list[str]:
+    if os.environ.get("DECOMPILE_ASCII") == "1":
+        return ASCII_SPINNER_FRAMES
+    return SPINNER_FRAMES
+
+
+class StatusLine:
+    def __init__(self) -> None:
+        self.enabled = sys.stdout.isatty() and os.environ.get("DECOMPILE_VERBOSE") != "1"
+        self.message = ""
+        self.active = False
+        self.index = 0
+        self.width = 0
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+
+    def start(self, message: str) -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            self.message = message
+            if self.active:
+                return
+            self.active = True
+            self.thread = threading.Thread(target=self._spin, daemon=True)
+            self.thread.start()
+
+    def update(self, message: str) -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            self.message = message
+
+    def stop(self, final: str | None = None) -> None:
+        if not self.enabled:
+            if final:
+                print(final)
+            return
+        thread = None
+        with self.lock:
+            self.active = False
+            thread = self.thread
+            self.thread = None
+        if thread:
+            thread.join(timeout=0.3)
+        self.clear()
+        if final:
+            print(final)
+
+    def clear(self) -> None:
+        if not self.enabled:
+            return
+        sys.stdout.write("\r" + " " * max(self.width, 1) + "\r")
+        sys.stdout.flush()
+        self.width = 0
+
+    def _spin(self) -> None:
+        while True:
+            with self.lock:
+                if not self.active:
+                    return
+                frames = spinner_frames()
+                frame = frames[self.index % len(frames)]
+                self.index += 1
+                text = f"{cyan(frame)} {dim(self.message)}"
+            text = text[: shutil.get_terminal_size((100, 20)).columns - 1]
+            self.width = max(self.width, len(text))
+            sys.stdout.write("\r" + text + " " * max(self.width - len(text), 0))
+            sys.stdout.flush()
+            time.sleep(0.12)
+
+
+STATUS = StatusLine()
+
+
+def is_verbose() -> bool:
+    return os.environ.get("DECOMPILE_VERBOSE") == "1"
+
+
+def status(message: str) -> None:
+    if STATUS.enabled:
+        STATUS.update(message)
+    elif is_verbose():
+        print(f"[+] {message}")
+
+
+def status_start(message: str) -> None:
+    if STATUS.enabled:
+        STATUS.start(message)
+    elif is_verbose():
+        print(f"[+] {message}")
+
+
+def status_done(message: str) -> None:
+    STATUS.stop(message)
+
+
+def print_clean(message: str = "") -> None:
+    STATUS.clear()
+    print(message)
 
 
 @dataclass
@@ -53,7 +219,9 @@ class Context:
 @dataclass
 class CliOptions:
     force_local: bool = False
+    ai: bool = False
     no_ai: bool = False
+    no_open: bool = False
     keep_debug: bool = False
     docker_image: str | None = None
     copilot_model: str | None = None
@@ -115,10 +283,14 @@ def main() -> int:
         )
 
         kind = force_kind or detect_kind(input_path)
+        local_ai_candidate = kind in NATIVE_KINDS and os.environ.get("DECOMPILE_NO_AI") != "1"
+        local_ai_deferred = local_ai_candidate and os.environ.get("DECOMPILE_AI_CONFIRMED") != "1"
+        original_keep_debug = ctx.keep_debug
+        if local_ai_deferred:
+            ctx.keep_debug = True
+
         initialize_metadata(ctx, kind)
-        print(f"[+] Input      : {ctx.input_path}")
-        print(f"[+] Output dir : {ctx.output_dir}")
-        print(f"[+] Type       : {kind}")
+        status_start(f"analyzing {ctx.input_path.name} as {kind}")
 
         if kind in NATIVE_KINDS:
             reverse_native(ctx, ctx.input_path, ctx.base_name)
@@ -133,16 +305,35 @@ def main() -> int:
         elif kind == "app-bundle":
             reverse_app_bundle(ctx)
         else:
-            print("[!] Unknown format; falling back to Ghidra native import.")
+            status("unknown format; falling back to native analysis")
             reverse_native(ctx, ctx.input_path, ctx.base_name)
 
         finalize_outputs(ctx, kind)
-        print_outputs(ctx)
+
+        completion_printed = False
+        if local_ai_deferred and (ctx.output_dir / "pseudocode.c").is_file():
+            if confirm_ai_enhancement(ctx.output_dir):
+                run_host_ai_enhancement(ctx.input_path, ctx.output_dir, ctx.base_name, original_keep_debug)
+                print_outputs(ctx)
+                completion_printed = True
+            elif not original_keep_debug:
+                safe_unlink(ctx.output_dir / "enhanced.c")
+                safe_unlink(ctx.output_dir / "report.md")
+                cleanup_host_ai_temp(ctx.output_dir, ctx.base_name, keep_debug=False)
+                sync_output_reports(ctx.output_dir)
+                print_output_manifest_line(ctx.output_dir)
+                open_output_dir(ctx.output_dir)
+                completion_printed = True
+
+        if not completion_printed:
+            print_outputs(ctx)
         return 0
     except DecompileError as exc:
+        STATUS.stop()
         print(f"[-] {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
+        STATUS.stop()
         print("[-] interrupted", file=sys.stderr)
         return 130
 
@@ -161,8 +352,12 @@ def parse_global_options(args: list[str]) -> tuple[list[str], CliOptions]:
         arg = args[index]
         if arg == "--local":
             options.force_local = True
+        elif arg == "--ai":
+            options.ai = True
         elif arg == "--no-ai":
             options.no_ai = True
+        elif arg == "--no-open":
+            options.no_open = True
         elif arg == "--keep-debug":
             options.keep_debug = True
         elif arg == "--update":
@@ -195,10 +390,16 @@ def parse_global_options(args: list[str]) -> tuple[list[str], CliOptions]:
 
 
 def apply_global_options(options: CliOptions) -> None:
+    if options.ai and options.no_ai:
+        raise DecompileError("--ai and --no-ai cannot be used together")
+    if options.ai:
+        os.environ["DECOMPILE_AI_CONFIRMED"] = "1"
     if options.no_ai:
         os.environ["DECOMPILE_NO_AI"] = "1"
     if options.keep_debug:
         os.environ["DECOMPILE_KEEP_DEBUG"] = "1"
+    if options.no_open:
+        os.environ["DECOMPILE_NO_OPEN"] = "1"
     if options.docker_image:
         os.environ["DECOMPILE_DOCKER_IMAGE"] = options.docker_image
     if options.copilot_model:
@@ -277,21 +478,42 @@ def run_in_docker(args: list[str]) -> int:
         command.extend(["--type", parsed["force_kind"]])
     command.extend([str(input_in_container), "/out"])
 
-    print(f"[+] Docker image: {image}")
-    print("[+] Running isolated container analysis")
-    result = subprocess.run(command)
+    status_start(f"running isolated static analysis in {image}")
+    result = run_process(command, "running isolated static analysis", check=False)
     if result.returncode == 125:
+        STATUS.stop()
         print("[-] Docker could not start the analysis container. Check Docker daemon status, image name, and mount permissions.", file=sys.stderr)
         return result.returncode
     elif result.returncode != 0:
+        STATUS.stop()
         print(f"[-] Analysis container exited with code {result.returncode}", file=sys.stderr)
+        if result.stdout:
+            print(compact_error(str(result.stdout), limit=800), file=sys.stderr)
         return result.returncode
 
     normalize_docker_reports(output_dir, input_path)
 
-    if host_ai_enabled:
-        return run_host_ai_enhancement(input_path, output_dir, sanitize_name(input_path.name), keep_debug)
+    if not host_ai_enabled:
+        safe_unlink(output_dir / "enhanced.c")
+        safe_unlink(output_dir / "report.md")
+        sync_output_reports(output_dir)
+        print_completed(output_dir, ai_ran=False)
+        return 0
 
+    if host_ai_enabled and (output_dir / "pseudocode.c").is_file():
+        if confirm_ai_enhancement(output_dir):
+            result_code = run_host_ai_enhancement(input_path, output_dir, sanitize_name(input_path.name), keep_debug)
+            print_completed(output_dir, ai_ran=result_code == 0)
+            return result_code
+        safe_unlink(output_dir / "enhanced.c")
+        safe_unlink(output_dir / "report.md")
+        cleanup_host_ai_temp(output_dir, sanitize_name(input_path.name), keep_debug=False)
+        sync_output_reports(output_dir)
+        print_output_manifest_line(output_dir)
+        open_output_dir(output_dir)
+        return 0
+
+    print_completed(output_dir, ai_ran=False)
     return 0
 
 
@@ -325,22 +547,22 @@ def ensure_docker_image(image: str) -> None:
     if subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         return
 
-    print(f"[+] Docker image missing locally: {image}")
+    status_start(f"pulling missing Docker image {image}")
     pull_docker_image(image)
 
 
 def update_docker_image() -> int:
     image = docker_image_name()
-    print(f"[+] Updating Docker image: {image}")
+    status_start(f"updating Docker image {image}")
     pull_docker_image(image)
-    print("[+] Docker image is up to date locally")
+    status_done("Docker image is up to date locally")
     return 0
 
 
 def pull_docker_image(image: str) -> None:
     ensure_docker_available()
 
-    result = run(["docker", "pull", image], check=False)
+    result = run(["docker", "pull", image], check=False, status_message=f"pulling Docker image {image}")
     if result.returncode == 0:
         return
 
@@ -405,7 +627,7 @@ def find_resource_path(name: str, dirs: list[Path]) -> Path:
 
 def run_host_ai_enhancement(input_path: Path, output_dir: Path, base_name: str, keep_debug: bool) -> int:
     if not (output_dir / "pseudocode.c").is_file():
-        print("[+] No native pseudocode output found; skipping host AI enhancement")
+        status("no native pseudocode output found; skipping AI")
         return 0
 
     try:
@@ -456,8 +678,13 @@ def run_host_ai_enhancement(input_path: Path, output_dir: Path, base_name: str, 
         else:
             env.pop("DECOMPILE_KEEP_COPILOT_DEBUG", None)
 
-        print("[+] Running host AI enhancement with GitHub CLI/Copilot")
-        result = run([str(enhancer), str(input_path), str(output_dir), base_name], check=False, env=env)
+        status("running AI reconstruction and report generation")
+        result = run(
+            [str(enhancer), str(input_path), str(output_dir), base_name],
+            check=False,
+            env=env,
+            status_message="running AI reconstruction and report generation",
+        )
         if result.returncode != 0:
             raise DecompileError(
                 "host AI enhancement failed. Check 'gh auth status' and GitHub Copilot CLI availability, "
@@ -465,9 +692,12 @@ def run_host_ai_enhancement(input_path: Path, output_dir: Path, base_name: str, 
             )
 
         enhanced_legacy = output_dir / f"{base_name}.enhanced.c"
+        report_legacy = output_dir / f"{base_name}.report.md"
         summary_legacy = output_dir / f"{base_name}.summary.txt"
         if enhanced_legacy.exists():
             move_generated_file(enhanced_legacy, output_dir / "enhanced.c")
+        if report_legacy.exists():
+            move_generated_file(report_legacy, output_dir / "report.md")
         if summary_legacy.exists():
             move_generated_file(summary_legacy, output_dir / "summary.txt")
 
@@ -477,7 +707,7 @@ def run_host_ai_enhancement(input_path: Path, output_dir: Path, base_name: str, 
             update_summary_after_host_ai(output_dir)
         update_metadata_after_host_ai(output_dir)
 
-        print("[+] Host AI enhancement complete")
+        status("AI reconstruction complete")
         return 0
     except Exception:
         cleanup_host_ai_temp(output_dir, base_name, keep_debug)
@@ -489,8 +719,11 @@ def host_ai_debug_files(base_name: str) -> dict[str, str]:
     return {
         f"{base_name}.enhanced.raw.jsonl": "enhanced.raw.jsonl",
         f"{base_name}.enhanced.response.txt": "enhanced.response.txt",
+        f"{base_name}.report.raw.jsonl": "report.raw.jsonl",
+        f"{base_name}.report.response.md": "report.response.md",
         f"{base_name}.enhanced.syntax.log": "enhanced.syntax.log",
         f"{base_name}.enhance.prompt.txt": "enhance.prompt.txt",
+        f"{base_name}.report.prompt.txt": "report.prompt.txt",
         f"{base_name}.enhance.fix.prompt.txt": "enhance.fix.prompt.txt",
         f"{base_name}.enhanced.fix.raw.jsonl": "enhanced.fix.raw.jsonl",
         f"{base_name}.enhanced.fix.response.txt": "enhanced.fix.response.txt",
@@ -504,7 +737,6 @@ def cleanup_host_ai_temp(output_dir: Path, base_name: str, keep_debug: bool) -> 
         "summary.txt",
         "objdump.txt",
         "objdump.err",
-        "enhanced.c",
     ]:
         safe_unlink(output_dir / f"{base_name}.{suffix}")
 
@@ -544,11 +776,14 @@ def update_summary_after_host_ai(output_dir: Path) -> None:
         return
     text = summary.read_text(encoding="utf-8", errors="replace")
     text = re.sub(r"(?m)^Enhanced file\s*:.*\n?", "", text)
+    text = re.sub(r"(?m)^AI report\s*:.*\n?", "", text)
     text = re.sub(r"(?m)^AI runner\s*:.*\n?", "", text)
     text = re.sub(r"(?m)^enhancer\s+skipped\s+DECOMPILE_NO_AI=1\s*\n?", "", text)
     text = append_summary_tool_status(text, "host-enhancer            ok       host GitHub CLI/Copilot")
     text = text.rstrip() + "\n"
     text += f"Enhanced file      : {output_dir / 'enhanced.c'}\n"
+    if (output_dir / "report.md").exists():
+        text += f"AI report          : {output_dir / 'report.md'}\n"
     text += "AI runner          : host GitHub CLI/Copilot\n"
     text = refresh_summary_outputs(text, output_dir)
     summary.write_text(text.rstrip() + "\n", encoding="utf-8")
@@ -631,7 +866,9 @@ def print_usage() -> None:
 """Usage:
   decompile <file-or-bundle> [output-dir]
   decompile --local <file-or-bundle> [output-dir]
+  decompile --ai <file-or-bundle> [output-dir]
   decompile --no-ai <file-or-bundle> [output-dir]
+  decompile --no-open <file-or-bundle> [output-dir]
   decompile <file-or-bundle> --model <model> [output-dir]
   decompile <file-or-bundle> --effort <low|medium|high|xhigh> [output-dir]
   decompile --update [--image <image>]
@@ -654,6 +891,8 @@ Environment:
   GHIDRA_SCRIPT_PATH          directory containing DumpAllDecompile.java
   GHIDRA_TIMEOUT              per-function timeout in seconds, default 120
   DECOMPILE_NO_AI=1           skip Copilot enhanced C and copy pseudocode instead
+  DECOMPILE_NO_OPEN=1         do not open the output directory in an editor
+  DECOMPILE_VERBOSE=1         print full tool logs instead of compact progress
   DECOMPILE_KEEP_DEBUG=1      keep objdump/prompt/raw debug files
   DECOMPILE_COPILOT_MODEL     optional Copilot model for enhanced.c
   DECOMPILE_COPILOT_EFFORT    optional low, medium, high, xhigh"""
@@ -792,10 +1031,59 @@ def run(
     stdout=None,
     stderr=None,
     env: dict[str, str] | None = None,
+    status_message: str | None = None,
 ) -> subprocess.CompletedProcess:
     display = " ".join(cmd)
-    print(f"[+] $ {display}")
-    result = subprocess.run(cmd, cwd=str(cwd) if cwd else None, stdout=stdout, stderr=stderr, text=False, env=env)
+    result = run_process(cmd, status_message or display, cwd=cwd, check=False, stdout=stdout, stderr=stderr, env=env)
+    if check and result.returncode != 0:
+        raise DecompileError(f"command failed ({result.returncode}): {display}")
+    return result
+
+
+def run_process(
+    cmd: list[str],
+    message: str,
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    stdout=None,
+    stderr=None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    display = " ".join(cmd)
+    if is_verbose():
+        print(f"[+] $ {display}")
+    status(message)
+
+    if is_verbose() or stdout is not None or stderr is not None:
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            stdout=stdout,
+            stderr=stderr,
+            text=False,
+            env=env,
+        )
+    else:
+        last_lines: deque[str] = deque(maxlen=30)
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            env=env,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            cleaned = " ".join(line.strip().split())
+            if cleaned:
+                last_lines.append(cleaned)
+                status(cleaned)
+        return_code = process.wait()
+        result = subprocess.CompletedProcess(cmd, return_code, stdout="\n".join(last_lines), stderr="")
+
     if check and result.returncode != 0:
         raise DecompileError(f"command failed ({result.returncode}): {display}")
     return result
@@ -1196,7 +1484,7 @@ def reverse_native(ctx: Context, binary: Path, output_base: str) -> None:
 
     project_dir = Path(tempfile.mkdtemp(prefix="ghidra-project."))
     try:
-        print(f"[+] Analyzer   : {analyze}")
+        status("running Ghidra headless analysis")
         with tempfile.TemporaryDirectory(prefix="decompile-home.") as home:
             result = run(
                 [
@@ -1215,6 +1503,7 @@ def reverse_native(ctx: Context, binary: Path, output_base: str) -> None:
                     "-deleteProject",
                 ],
                 env=isolated_tool_env(Path(home)),
+                status_message="running Ghidra headless analysis",
             )
             record_tool(ctx, "ghidra", result)
     finally:
@@ -1231,7 +1520,6 @@ def reverse_native(ctx: Context, binary: Path, output_base: str) -> None:
         record_tool(ctx, "objdump", result)
     run_enhancer(ctx, binary, output_base)
 
-    require_file(ctx.output_dir / f"{output_base}.enhanced.c")
     canonicalize_native_outputs(ctx, output_base)
 
 
@@ -1245,20 +1533,20 @@ def generate_objdump(binary: Path, output: Path, error_output: Path) -> subproce
 
 
 def run_enhancer(ctx: Context, binary: Path, output_base: str) -> None:
-    pseudocode = ctx.output_dir / f"{output_base}.pseudocode.c"
-    enhanced = ctx.output_dir / f"{output_base}.enhanced.c"
-
-    if os.environ.get("DECOMPILE_NO_AI") == "1":
-        print("[+] DECOMPILE_NO_AI=1; using raw pseudocode as enhanced.c fallback")
-        enhanced.write_text(pseudocode.read_text(errors="replace"), errors="replace")
-        append_summary(ctx.output_dir / f"{output_base}.summary.txt", f"Enhanced file          : {enhanced}")
-        ctx.tool_statuses.append({"name": "enhancer", "status": "skipped", "reason": "DECOMPILE_NO_AI=1"})
+    if os.environ.get("DECOMPILE_NO_AI") == "1" or os.environ.get("DECOMPILE_AI_CONFIRMED") != "1":
+        status("static decompile complete; AI reconstruction deferred")
+        safe_unlink(ctx.output_dir / f"{output_base}.enhanced.c")
+        safe_unlink(ctx.output_dir / f"{output_base}.report.md")
+        safe_unlink(ctx.output_dir / "enhanced.c")
+        safe_unlink(ctx.output_dir / "report.md")
+        reason = "DECOMPILE_NO_AI=1" if os.environ.get("DECOMPILE_NO_AI") == "1" else "waiting for user confirmation"
+        ctx.tool_statuses.append({"name": "enhancer", "status": "skipped", "reason": reason})
         return
 
     enhancer = find_resource(ctx, "enhance_with_copilot")
     if not os.access(enhancer, os.X_OK):
         raise DecompileError(f"enhancer is not executable: {enhancer}")
-    result = run([str(enhancer), str(binary), str(ctx.output_dir), output_base])
+    result = run([str(enhancer), str(binary), str(ctx.output_dir), output_base], status_message="running AI reconstruction")
     record_tool(ctx, "enhancer", result)
 
 
@@ -1318,7 +1606,7 @@ def reverse_java(ctx: Context, kind: str) -> None:
 def reverse_dotnet(ctx: Context) -> None:
     ilspy = which("ilspycmd")
     if not ilspy:
-        print("[!] Detected .NET metadata, but ilspycmd is not installed; falling back to Ghidra PE analysis.")
+        status("detected .NET metadata, but ilspycmd is missing; falling back to native analysis")
         reverse_native(ctx, ctx.input_path, ctx.base_name)
         summary = summary_path(ctx)
         append_summary(summary, "Detected .NET       : yes")
@@ -1493,6 +1781,7 @@ def canonicalize_native_outputs(ctx: Context, output_base: str) -> None:
     move_generated_file(ctx.output_dir / f"{output_base}.pseudocode.c", ctx.output_dir / "pseudocode.c")
     move_generated_file(ctx.output_dir / f"{output_base}.disassembly.asm", ctx.output_dir / "disassembly.asm")
     move_generated_file(ctx.output_dir / f"{output_base}.enhanced.c", ctx.output_dir / "enhanced.c")
+    move_generated_file(ctx.output_dir / f"{output_base}.report.md", ctx.output_dir / "report.md")
     move_generated_file(ctx.output_dir / f"{output_base}.summary.txt", summary_path(ctx))
 
     debug_files = {
@@ -1500,8 +1789,11 @@ def canonicalize_native_outputs(ctx: Context, output_base: str) -> None:
         f"{output_base}.objdump.err": "objdump.err",
         f"{output_base}.enhanced.raw.jsonl": "enhanced.raw.jsonl",
         f"{output_base}.enhanced.response.txt": "enhanced.response.txt",
+        f"{output_base}.report.raw.jsonl": "report.raw.jsonl",
+        f"{output_base}.report.response.md": "report.response.md",
         f"{output_base}.enhanced.syntax.log": "enhanced.syntax.log",
         f"{output_base}.enhance.prompt.txt": "enhance.prompt.txt",
+        f"{output_base}.report.prompt.txt": "report.prompt.txt",
         f"{output_base}.enhance.fix.prompt.txt": "enhance.fix.prompt.txt",
         f"{output_base}.enhanced.fix.raw.jsonl": "enhanced.fix.raw.jsonl",
         f"{output_base}.enhanced.fix.response.txt": "enhanced.fix.response.txt",
@@ -1660,13 +1952,126 @@ def append_counted_items(lines: list[str], title: str, data: object) -> None:
         lines.append("  none")
 
 
+def confirm_ai_enhancement(output_dir: Path) -> bool:
+    if os.environ.get("DECOMPILE_AI_CONFIRMED") == "1":
+        status("starting AI reconstruction")
+        return True
+    if os.environ.get("DECOMPILE_NO_AI") == "1":
+        return False
+
+    STATUS.stop(f"{green(symbol('ok'))} {bold('decompile completed')} {dim(str(output_dir))}")
+    if not sys.stdin.isatty():
+        print(f"{dim('AI skipped: stdin is not interactive. Rerun with --ai to continue automatically.')}")
+        return False
+
+    prompt = f"{green(symbol('question'))} {bold('Continue with AI reconstruction and report.md?')} {dim('Yes /')} {cyan('No')} "
+    answer = input(prompt).strip().lower()
+    accepted = answer in {"y", "yes"}
+    if accepted:
+        print(f"{green(symbol('ok'))} AI reconstruction: {green('Yes')}")
+    else:
+        print(f"{dim('AI reconstruction: No')}")
+    return accepted
+
+
+def print_completed(output_dir: Path, *, ai_ran: bool = False) -> None:
+    suffix = " with AI" if ai_ran else ""
+    status_done(f"{green(symbol('ok'))} {bold('decompile completed' + suffix)} {dim(str(output_dir))}")
+    print_output_manifest_line(output_dir)
+    open_output_dir(output_dir)
+
+
+def print_output_manifest_line(output_dir: Path) -> None:
+    items = build_output_manifest(output_dir)
+    if not items:
+        return
+    print_tree(output_dir, items)
+
+
+def print_tree(output_dir: Path, items: list[dict[str, object]]) -> None:
+    print(f"{dim('Output tree:')}")
+    print(f"{symbol('folder')} {bold(output_dir.name + '/')}")
+
+    groups: list[tuple[str, list[str]]] = [
+        ("core", ["summary.txt", "metadata.json"]),
+        ("native", ["disassembly.asm", "pseudocode.c", "enhanced.c"]),
+        ("ai", ["report.md"]),
+        ("source", ["source/", "resources/", "ios/", "app/"]),
+        ("debug", ["debug/"]),
+    ]
+    available = {str(item.get("path")): item for item in items if isinstance(item.get("path"), str)}
+    used: set[str] = set()
+    rendered_groups: list[tuple[str, list[dict[str, object]]]] = []
+
+    for title, names in groups:
+        group_items = []
+        for name in names:
+            item = available.get(name)
+            if item:
+                used.add(name)
+                group_items.append(item)
+        if group_items:
+            rendered_groups.append((title, group_items))
+
+    other_items = [item for name, item in sorted(available.items()) if name not in used]
+    if other_items:
+        rendered_groups.append(("other", other_items))
+
+    for group_index, (title, group_items) in enumerate(rendered_groups):
+        group_last = group_index == len(rendered_groups) - 1
+        group_branch = tree_last() if group_last else tree_mid()
+        group_prefix = "   " if group_last else tree_pipe()
+        print(f"{group_branch} {cyan(title)}/")
+        for item_index, item in enumerate(group_items):
+            item_last = item_index == len(group_items) - 1
+            item_branch = tree_last() if item_last else tree_mid()
+            path = str(item.get("path"))
+            detail = output_item_detail(item)
+            print(f"{group_prefix}{item_branch} {path} {dim(detail)}")
+
+
+def output_item_detail(item: dict[str, object]) -> str:
+    if item.get("type") == "file":
+        size = item.get("size")
+        return f"{size} bytes" if isinstance(size, int) else "file"
+    files = item.get("files")
+    return f"{files} files" if isinstance(files, int) else "directory"
+
+
+def open_output_dir(output_dir: Path) -> None:
+    if os.environ.get("DECOMPILE_NO_OPEN") == "1":
+        return
+    if os.environ.get("DECOMPILE_IN_DOCKER") == "1":
+        return
+    if not sys.stdout.isatty():
+        return
+
+    for editor in ["zed", "code", "nvim"]:
+        executable = which(editor)
+        if not executable:
+            continue
+        if editor == "nvim":
+            print(f"{green(symbol('ok'))} opening {dim(str(output_dir))} in {cyan(editor)}")
+            subprocess.run([executable, str(output_dir)])
+            return
+        try:
+            subprocess.Popen(
+                [executable, str(output_dir)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            continue
+        print(f"{green(symbol('ok'))} opened {dim(str(output_dir))} in {cyan(editor)}")
+        return
+
+    print(f"{dim('No editor found: install zed, code, or nvim; or open the output directory manually.')}")
+
+
 def print_outputs(ctx: Context) -> None:
-    print("[+] Done")
-    for path in sorted(ctx.output_dir.iterdir()):
-        if path.is_file() and path.name in {"summary.txt", "metadata.json", "disassembly.asm", "pseudocode.c", "enhanced.c"}:
-            print(f"[+] Output     : {path}")
-        elif path.is_dir() and path.name in {"source", "resources", "ios", "app", "debug"}:
-            print(f"[+] Output     : {path}/")
+    print_completed(ctx.output_dir, ai_ran=(ctx.output_dir / "report.md").exists())
 
 
 if __name__ == "__main__":

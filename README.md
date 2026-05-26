@@ -26,6 +26,7 @@ Docker is required for the normal published workflow.
 
 ```sh
 decompile ./crackme
+decompile --ai ./crackme
 decompile --no-ai ./crackme
 decompile --image docker.io/admin12121/decompile:stable ./crackme
 decompile --local ./crackme
@@ -65,6 +66,7 @@ metadata.json
 disassembly.asm
 pseudocode.c
 enhanced.c
+report.md
 ```
 
 Android, Java, and .NET output usually includes:
@@ -122,10 +124,23 @@ Inside Docker:
 
 For native binaries, `enhanced.c` can be generated from pseudocode, disassembly, objdump context, and summary data.
 
-Use this when you want cleaner function names, variables, and reconstructed C-like output:
+Default native analysis finishes static decompilation first, then asks whether to continue with AI:
 
 ```sh
 decompile ./file
+```
+
+Run AI without prompting:
+
+```sh
+decompile --ai ./file
+```
+
+When AI is enabled it writes:
+
+```text
+enhanced.c
+report.md
 ```
 
 This phase runs on the host with:
@@ -147,7 +162,9 @@ When AI is enabled, analysis context may be sent to GitHub Copilot through the h
 
 ```text
 decompile <file-or-bundle> [output-dir]
+decompile --ai <file-or-bundle> [output-dir]
 decompile --no-ai <file-or-bundle> [output-dir]
+decompile --no-open <file-or-bundle> [output-dir]
 decompile <file-or-bundle> --model <model> [output-dir]
 decompile <file-or-bundle> --effort <low|medium|high|xhigh> [output-dir]
 decompile --update [--image <image>]
@@ -169,6 +186,8 @@ Useful environment variables:
 DECOMPILE_DOCKER_IMAGE      override the Docker image
 DECOMPILE_USE_DOCKER=0      run local host tools
 DECOMPILE_NO_AI=1           skip AI enhancement
+DECOMPILE_NO_OPEN=1         do not open output in zed/code/nvim
+DECOMPILE_VERBOSE=1         print full tool logs instead of compact progress
 DECOMPILE_KEEP_DEBUG=1      keep objdump and prompt/debug files
 GHIDRA_TIMEOUT=120          per-function decompile timeout
 DECOMPILE_COPILOT_MODEL     optional host Copilot model

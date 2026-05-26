@@ -129,9 +129,13 @@ disassembly="$out_dir/${base_name}.disassembly.asm"
 summary="$out_dir/${base_name}.summary.txt"
 objdump="$out_dir/${base_name}.objdump.txt"
 enhanced="$out_dir/${base_name}.enhanced.c"
+report="$out_dir/${base_name}.report.md"
 raw_response="$out_dir/${base_name}.enhanced.raw.jsonl"
 assistant_response="$out_dir/${base_name}.enhanced.response.txt"
+report_raw="$out_dir/${base_name}.report.raw.jsonl"
+report_response="$out_dir/${base_name}.report.response.md"
 prompt_file="$out_dir/${base_name}.enhance.prompt.txt"
+report_prompt_file="$out_dir/${base_name}.report.prompt.txt"
 fix_prompt_file="$out_dir/${base_name}.enhance.fix.prompt.txt"
 syntax_log="$out_dir/${base_name}.enhanced.syntax.log"
 
@@ -150,8 +154,14 @@ Read these files before answering:
 - objdump output: $objdump
 - original binary path: $binary
 
+Important workflow:
+- Do not paste entire huge files into your reasoning.
+- Inspect the summary first, then relevant functions, strings, imports, sections, and entry/main-like logic.
+- Use objdump section dumps for hidden constants/data and packing indicators.
+- Treat UPX/packer stubs, PLT/thunks, compiler runtime, Ghidra boilerplate, and random unreachable/noise functions as non-core unless clearly relevant.
+
 Task:
-Rebuild a clean, readable, recompileable C source file from the provided artifacts.
+Reconstruct only the likely real program logic as clean, readable C. This is not an exact source recovery task.
 
 Hard requirements:
 - Output ONLY C code.
@@ -159,7 +169,7 @@ Hard requirements:
 - Do not explain anything.
 - Do not add comments.
 - Do not include prose before or after the code.
-- Preserve program behavior as closely as possible.
+- Preserve the core behavior as closely as confidence allows.
 - Use meaningful function names and variable names.
 - Remove Ghidra/runtime noise such as stack canary boilerplate, PLT wrappers, _INIT/_FINI, entry stubs, and undefinedN typedef noise.
 - Use standard C headers and standard C types.
@@ -167,9 +177,11 @@ Hard requirements:
 - Inline readable strings and constants when confidence is high.
 - Keep encoded byte arrays when needed for behavior.
 - If a decoded constant/string is recoverable from the bytes and disassembly, express it clearly in code.
-- The result should compile with a normal C compiler where possible.
+- Prefer a compact, understandable reconstruction over copying every decompiled function.
+- If the binary is packed or mostly wrapper/runtime code, reconstruct the unpacking/checking/dispatch logic that is visible and omit unsupported guesses.
+- The result should compile with a normal C compiler where possible, but readable true logic is more important than fake completeness.
 
-Return the complete C source file now.
+Return the complete reconstructed C source file now.
 EOF
 
 args=(
@@ -193,7 +205,6 @@ if [[ -n "${DECOMPILE_COPILOT_EFFORT:-}" ]]; then
   args+=(--effort "$DECOMPILE_COPILOT_EFFORT")
 fi
 
-echo "[+] Enhancing with GitHub Copilot CLI..."
 gh "${args[@]}" >"$raw_response"
 copilot_json_to_text "$raw_response" "$assistant_response"
 extract_c_code <"$assistant_response" >"$enhanced"
@@ -248,7 +259,6 @@ EOF
       fix_args+=(--model "$DECOMPILE_COPILOT_MODEL")
     fi
 
-    echo "[+] Copilot output did not compile; requesting one repair pass..."
     gh "${fix_args[@]}" >"$fix_raw"
     copilot_json_to_text "$fix_raw" "$fix_response"
     extract_c_code <"$fix_response" >"$enhanced"
@@ -257,12 +267,64 @@ EOF
   fi
 fi
 
-sed -i '/^Enhanced file[[:space:]]*:/d' "$summary"
-printf '\nEnhanced file          : %s\n' "$enhanced" >>"$summary"
+cat >"$report_prompt_file" <<EOF
+You are writing a reverse-engineering report from static analysis artifacts.
 
-if [[ "${DECOMPILE_KEEP_COPILOT_DEBUG:-0}" != "1" ]]; then
-  rm -f "$raw_response" "$assistant_response" "$syntax_log" "$prompt_file" "$fix_prompt_file"
-  rm -f "$out_dir/${base_name}.enhanced.fix.raw.jsonl" "$out_dir/${base_name}.enhanced.fix.response.txt"
+Read:
+- Summary: $summary
+- Reconstructed C: $enhanced
+- Ghidra pseudocode: $pseudocode
+- Ghidra disassembly: $disassembly
+- objdump output: $objdump
+- original binary path: $binary
+
+Write a concise Markdown report for an analyst.
+
+Include:
+- high-level behavior
+- likely real logic vs compiler/runtime/packer noise
+- important strings, imports, sections, constants, and suspicious data
+- packing/wrapper indicators such as UPX-like sections or high entropy when visible
+- important functions or addresses worth reviewing
+- confidence and limitations
+
+Do not include generic reverse-engineering advice.
+Do not claim certainty when the artifacts are ambiguous.
+EOF
+
+report_args=(
+  copilot
+  -p "$(cat "$report_prompt_file")"
+  -s
+  --no-color
+  --stream off
+  --output-format json
+  --no-custom-instructions
+  --allow-all-tools
+  --add-dir "$out_dir"
+  --add-dir "$(dirname "$binary")"
+)
+
+if [[ -n "${DECOMPILE_COPILOT_MODEL:-}" ]]; then
+  report_args+=(--model "$DECOMPILE_COPILOT_MODEL")
 fi
 
-echo "[+] Enhanced saved: $enhanced"
+if [[ -n "${DECOMPILE_COPILOT_EFFORT:-}" ]]; then
+  report_args+=(--effort "$DECOMPILE_COPILOT_EFFORT")
+fi
+
+gh "${report_args[@]}" >"$report_raw"
+copilot_json_to_text "$report_raw" "$report_response"
+sed -e 's/\r$//' -e '/^```/d' "$report_response" >"$report"
+[[ -s "$report" ]] || die "Copilot returned an empty report"
+
+sed -i '/^Enhanced file[[:space:]]*:/d' "$summary"
+sed -i '/^AI report[[:space:]]*:/d' "$summary"
+printf '\nEnhanced file          : %s\n' "$enhanced" >>"$summary"
+printf 'AI report              : %s\n' "$report" >>"$summary"
+
+if [[ "${DECOMPILE_KEEP_COPILOT_DEBUG:-0}" != "1" ]]; then
+  rm -f "$raw_response" "$assistant_response" "$report_raw" "$report_response"
+  rm -f "$syntax_log" "$prompt_file" "$report_prompt_file" "$fix_prompt_file"
+  rm -f "$out_dir/${base_name}.enhanced.fix.raw.jsonl" "$out_dir/${base_name}.enhanced.fix.response.txt"
+fi
