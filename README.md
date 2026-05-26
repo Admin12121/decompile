@@ -80,6 +80,10 @@ resources/
 
 `summary.txt` is the human report. It includes file type, architecture, entropy, sections, imports, symbols, strings, tool exit status, and decompiler details when available.
 
+Native analysis also records likely packer indicators such as UPX section names, high entropy, tiny import tables, and suspicious packed section names. If `upx` is available and the binary looks UPX-packed, the tool tests and unpacks a temporary copy for analysis without modifying the original file.
+
+For PE/EXE/DLL/SYS inputs, a matching `.pdb` beside the binary is detected automatically and recorded in `summary.txt`/`metadata.json` for Ghidra and AI context.
+
 `metadata.json` is the machine-readable version for scripts and future UI work.
 
 ## Docker Model
@@ -187,6 +191,7 @@ DECOMPILE_DOCKER_IMAGE      override the Docker image
 DECOMPILE_USE_DOCKER=0      run local host tools
 DECOMPILE_NO_AI=1           skip AI enhancement
 DECOMPILE_NO_OPEN=1         do not open output in zed/code/nvim
+DECOMPILE_NO_UNPACK=1       skip automatic UPX unpack attempts
 DECOMPILE_VERBOSE=1         print full tool logs instead of compact progress
 DECOMPILE_KEEP_DEBUG=1      keep objdump and prompt/debug files
 GHIDRA_TIMEOUT=120          per-function decompile timeout

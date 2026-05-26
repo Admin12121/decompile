@@ -32,6 +32,7 @@ RUN apt-get clean && \
       curl \
       unzip \
       zip \
+      upx-ucl \
       ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 

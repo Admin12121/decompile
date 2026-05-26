@@ -16,6 +16,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from decompile_tool.heuristics import run_heuristic_analysis
+
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -317,8 +319,7 @@ def main() -> int:
                 print_outputs(ctx)
                 completion_printed = True
             elif not original_keep_debug:
-                safe_unlink(ctx.output_dir / "enhanced.c")
-                safe_unlink(ctx.output_dir / "report.md")
+                remove_stale_ai_outputs(ctx.output_dir)
                 cleanup_host_ai_temp(ctx.output_dir, ctx.base_name, keep_debug=False)
                 sync_output_reports(ctx.output_dir)
                 print_output_manifest_line(ctx.output_dir)
@@ -494,8 +495,7 @@ def run_in_docker(args: list[str]) -> int:
     normalize_docker_reports(output_dir, input_path)
 
     if not host_ai_enabled:
-        safe_unlink(output_dir / "enhanced.c")
-        safe_unlink(output_dir / "report.md")
+        remove_stale_ai_outputs(output_dir)
         sync_output_reports(output_dir)
         print_completed(output_dir, ai_ran=False)
         return 0
@@ -505,8 +505,7 @@ def run_in_docker(args: list[str]) -> int:
             result_code = run_host_ai_enhancement(input_path, output_dir, sanitize_name(input_path.name), keep_debug)
             print_completed(output_dir, ai_ran=result_code == 0)
             return result_code
-        safe_unlink(output_dir / "enhanced.c")
-        safe_unlink(output_dir / "report.md")
+        remove_stale_ai_outputs(output_dir)
         cleanup_host_ai_temp(output_dir, sanitize_name(input_path.name), keep_debug=False)
         sync_output_reports(output_dir)
         print_output_manifest_line(output_dir)
@@ -732,8 +731,6 @@ def host_ai_debug_files(base_name: str) -> dict[str, str]:
 
 def cleanup_host_ai_temp(output_dir: Path, base_name: str, keep_debug: bool) -> None:
     for suffix in [
-        "pseudocode.c",
-        "disassembly.asm",
         "summary.txt",
         "objdump.txt",
         "objdump.err",
@@ -749,6 +746,13 @@ def cleanup_host_ai_temp(output_dir: Path, base_name: str, keep_debug: bool) -> 
         for source_name in host_ai_debug_files(base_name):
             safe_unlink(output_dir / source_name)
         shutil.rmtree(debug_dir, ignore_errors=True)
+
+
+def remove_stale_ai_outputs(output_dir: Path) -> None:
+    if (output_dir / "logic.json").exists() or (output_dir / "ai_context.md").exists():
+        return
+    safe_unlink(output_dir / "enhanced.c")
+    safe_unlink(output_dir / "report.md")
 
 
 def sync_output_reports(output_dir: Path) -> None:
@@ -892,6 +896,7 @@ Environment:
   GHIDRA_TIMEOUT              per-function timeout in seconds, default 120
   DECOMPILE_NO_AI=1           skip Copilot enhanced C and copy pseudocode instead
   DECOMPILE_NO_OPEN=1         do not open the output directory in an editor
+  DECOMPILE_NO_UNPACK=1       skip automatic UPX unpack attempts
   DECOMPILE_VERBOSE=1         print full tool logs instead of compact progress
   DECOMPILE_KEEP_DEBUG=1      keep objdump/prompt/raw debug files
   DECOMPILE_COPILOT_MODEL     optional Copilot model for enhanced.c
@@ -946,7 +951,7 @@ def run_doctor(options: CliOptions) -> int:
     if analyze:
         add("OK", "analyzeHeadless", str(analyze))
 
-    for tool in ["jadx", "apktool", "ilspycmd", "objdump", "readelf", "nm", "file", "gcc"]:
+    for tool in ["jadx", "apktool", "ilspycmd", "objdump", "readelf", "nm", "file", "gcc", "upx"]:
         path = which(tool)
         add("OK" if path else "WARN", tool, path or "missing; needed only for related input types")
 
@@ -1170,13 +1175,106 @@ def collect_static_metadata(ctx: Context) -> None:
         ctx.metadata["sections"] = collect_sections(ctx, binary)
         ctx.metadata["imports"] = collect_imports(ctx, binary)
         ctx.metadata["symbols"] = collect_symbols(ctx, binary)
+        ctx.metadata["debug_symbols"] = detect_debug_symbols(ctx, binary, kind, file_description)
+        ctx.metadata["packer"] = detect_packer(ctx)
     else:
         ctx.metadata["architecture"] = parse_architecture(file_description, "")
         ctx.metadata["sections"] = []
         ctx.metadata["imports"] = {"count": 0, "items": [], "truncated": False}
         ctx.metadata["symbols"] = {"count": 0, "items": [], "truncated": False}
+        ctx.metadata["debug_symbols"] = {"pdb": None}
+        ctx.metadata["packer"] = {"likely": False, "families": [], "indicators": []}
 
     ctx.metadata["strings"] = extract_ascii_strings(binary)
+
+
+def detect_debug_symbols(ctx: Context, binary: Path, kind: str, file_description: str) -> dict[str, object]:
+    result: dict[str, object] = {"pdb": None}
+    if not is_pe_input(binary, kind, file_description):
+        return result
+
+    pdb = find_companion_pdb(binary)
+    if not pdb:
+        return result
+
+    try:
+        size, sha256, _ = file_size_hash_entropy(pdb)
+    except OSError:
+        size, sha256 = 0, ""
+    result["pdb"] = {
+        "path": str(pdb),
+        "name": pdb.name,
+        "size": size,
+        "sha256": sha256,
+        "usage": "detected beside PE input; available to Ghidra and AI context",
+    }
+    ctx.tool_statuses.append({"name": "pdb-detect", "status": "ok", "path": str(pdb)})
+    return result
+
+
+def is_pe_input(binary: Path, kind: str, file_description: str) -> bool:
+    suffix = binary.suffix.lower()
+    if suffix in {".exe", ".dll", ".sys", ".scr", ".cpl", ".ocx"}:
+        return True
+    if kind in {"pe", "dotnet"}:
+        return True
+    return "PE32" in file_description or "MS Windows" in file_description
+
+
+def find_companion_pdb(binary: Path) -> Path | None:
+    try:
+        siblings = [path for path in binary.parent.iterdir() if path.is_file() and path.suffix.lower() == ".pdb"]
+    except OSError:
+        return None
+    if not siblings:
+        return None
+
+    stem = binary.stem.lower()
+    for pdb in siblings:
+        if pdb.stem.lower() == stem:
+            return pdb
+    if len(siblings) == 1:
+        return siblings[0]
+    return None
+
+
+def detect_packer(ctx: Context) -> dict[str, object]:
+    indicators: list[str] = []
+    families: set[str] = set()
+
+    input_info = ctx.metadata.get("input", {})
+    entropy = input_info.get("entropy") if isinstance(input_info, dict) else None
+    if isinstance(entropy, (int, float)) and entropy >= 7.2:
+        indicators.append(f"high file entropy ({entropy} bits/byte)")
+
+    sections = ctx.metadata.get("sections", [])
+    section_names = []
+    if isinstance(sections, list):
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            name = str(section.get("name", ""))
+            section_names.append(name)
+            lower = name.lower()
+            if lower in {"upx0", "upx1", "upx2"}:
+                families.add("upx")
+                indicators.append(f"UPX section name {name}")
+            elif lower in {".packed", "packed", ".aspack", ".adata", "petite", ".themida", ".vmp0", ".vmp1"}:
+                indicators.append(f"suspicious packed section name {name}")
+
+    if section_names and len(section_names) <= 4:
+        indicators.append(f"small section table ({len(section_names)} sections)")
+
+    imports = ctx.metadata.get("imports", {})
+    import_count = imports.get("count") if isinstance(imports, dict) else None
+    if isinstance(import_count, int) and 0 < import_count <= 8:
+        indicators.append(f"very small import table ({import_count} imports)")
+
+    return {
+        "likely": bool(indicators),
+        "families": sorted(families),
+        "indicators": sorted(set(indicators)),
+    }
 
 
 def file_size_hash_entropy(path: Path) -> tuple[int, str, float]:
@@ -1483,6 +1581,8 @@ def reverse_native(ctx: Context, binary: Path, output_base: str) -> None:
     analyze = find_analyze_headless()
 
     project_dir = Path(tempfile.mkdtemp(prefix="ghidra-project."))
+    unpack_temp = tempfile.TemporaryDirectory(prefix="decompile-unpack.")
+    analysis_binary = prepare_native_analysis_binary(ctx, binary, Path(unpack_temp.name))
     try:
         status("running Ghidra headless analysis")
         with tempfile.TemporaryDirectory(prefix="decompile-home.") as home:
@@ -1492,7 +1592,7 @@ def reverse_native(ctx: Context, binary: Path, output_base: str) -> None:
                     str(project_dir),
                     "reverse_project",
                     "-import",
-                    str(binary),
+                    str(analysis_binary),
                     "-scriptPath",
                     str(dump_script.parent),
                     "-postScript",
@@ -1506,21 +1606,80 @@ def reverse_native(ctx: Context, binary: Path, output_base: str) -> None:
                 status_message="running Ghidra headless analysis",
             )
             record_tool(ctx, "ghidra", result)
+
+        require_file(ctx.output_dir / f"{output_base}.pseudocode.c")
+        require_file(ctx.output_dir / f"{output_base}.disassembly.asm")
+        require_file(ctx.output_dir / f"{output_base}.summary.txt")
+
+        objdump_path = ctx.output_dir / f"{output_base}.objdump.txt"
+        objdump_err = ctx.output_dir / f"{output_base}.objdump.err"
+        result = generate_objdump(analysis_binary, objdump_path, objdump_err)
+        if result:
+            record_tool(ctx, "objdump", result)
+        run_offline_heuristics(ctx, output_base)
+        run_enhancer(ctx, analysis_binary, output_base)
+
+        canonicalize_native_outputs(ctx, output_base)
     finally:
         shutil.rmtree(project_dir, ignore_errors=True)
+        unpack_temp.cleanup()
 
-    require_file(ctx.output_dir / f"{output_base}.pseudocode.c")
-    require_file(ctx.output_dir / f"{output_base}.disassembly.asm")
-    require_file(ctx.output_dir / f"{output_base}.summary.txt")
 
-    objdump_path = ctx.output_dir / f"{output_base}.objdump.txt"
-    objdump_err = ctx.output_dir / f"{output_base}.objdump.err"
-    result = generate_objdump(binary, objdump_path, objdump_err)
-    if result:
-        record_tool(ctx, "objdump", result)
-    run_enhancer(ctx, binary, output_base)
+def prepare_native_analysis_binary(ctx: Context, binary: Path, unpack_dir: Path) -> Path:
+    ctx.metadata.setdefault("analysis", {})
+    analysis = ctx.metadata["analysis"]
+    if isinstance(analysis, dict):
+        analysis["analyzed_path"] = str(binary)
 
-    canonicalize_native_outputs(ctx, output_base)
+    unpacked = maybe_unpack_upx(ctx, binary, unpack_dir)
+    if unpacked:
+        if isinstance(analysis, dict):
+            analysis["analyzed_path"] = str(unpacked)
+            analysis["unpacked_from"] = str(binary)
+        return unpacked
+    return binary
+
+
+def maybe_unpack_upx(ctx: Context, binary: Path, unpack_dir: Path) -> Path | None:
+    if os.environ.get("DECOMPILE_NO_UNPACK") == "1":
+        ctx.tool_statuses.append({"name": "upx", "status": "skipped", "reason": "DECOMPILE_NO_UNPACK=1"})
+        return None
+
+    packer = ctx.metadata.get("packer", {})
+    families = packer.get("families", []) if isinstance(packer, dict) else []
+    if "upx" not in families:
+        return None
+
+    upx = which("upx")
+    if not upx:
+        ctx.tool_statuses.append({"name": "upx", "status": "missing", "reason": "UPX indicators detected but upx is not installed"})
+        return None
+
+    status("UPX indicators detected; testing packed binary")
+    test_result = run([upx, "-t", str(binary)], check=False, status_message="testing UPX packed binary")
+    record_tool(ctx, "upx-test", test_result)
+    if test_result.returncode != 0:
+        return None
+
+    unpacked = unpack_dir / f"{sanitize_name(binary.stem)}.unpacked{binary.suffix or '.bin'}"
+    status("unpacking UPX binary for analysis")
+    unpack_result = run([upx, "-d", "-o", str(unpacked), str(binary)], check=False, status_message="unpacking UPX binary")
+    record_tool(ctx, "upx-unpack", unpack_result)
+    if unpack_result.returncode != 0 or not unpacked.is_file():
+        return None
+
+    try:
+        size, sha256, entropy = file_size_hash_entropy(unpacked)
+    except OSError:
+        size, sha256, entropy = 0, "", 0.0
+    ctx.metadata["unpacked"] = {
+        "tool": "upx",
+        "path": str(unpacked),
+        "size": size,
+        "sha256": sha256,
+        "entropy": entropy,
+    }
+    return unpacked
 
 
 def generate_objdump(binary: Path, output: Path, error_output: Path) -> subprocess.CompletedProcess | None:
@@ -1535,10 +1694,6 @@ def generate_objdump(binary: Path, output: Path, error_output: Path) -> subproce
 def run_enhancer(ctx: Context, binary: Path, output_base: str) -> None:
     if os.environ.get("DECOMPILE_NO_AI") == "1" or os.environ.get("DECOMPILE_AI_CONFIRMED") != "1":
         status("static decompile complete; AI reconstruction deferred")
-        safe_unlink(ctx.output_dir / f"{output_base}.enhanced.c")
-        safe_unlink(ctx.output_dir / f"{output_base}.report.md")
-        safe_unlink(ctx.output_dir / "enhanced.c")
-        safe_unlink(ctx.output_dir / "report.md")
         reason = "DECOMPILE_NO_AI=1" if os.environ.get("DECOMPILE_NO_AI") == "1" else "waiting for user confirmation"
         ctx.tool_statuses.append({"name": "enhancer", "status": "skipped", "reason": reason})
         return
@@ -1548,6 +1703,17 @@ def run_enhancer(ctx: Context, binary: Path, output_base: str) -> None:
         raise DecompileError(f"enhancer is not executable: {enhancer}")
     result = run([str(enhancer), str(binary), str(ctx.output_dir), output_base], status_message="running AI reconstruction")
     record_tool(ctx, "enhancer", result)
+
+
+def run_offline_heuristics(ctx: Context, output_base: str) -> None:
+    status("running offline heuristic reconstruction")
+    try:
+        logic = run_heuristic_analysis(output_dir=ctx.output_dir, base_name=output_base, metadata=ctx.metadata)
+    except Exception as exc:
+        ctx.tool_statuses.append({"name": "heuristics", "status": "failed", "stderr": compact_error(str(exc))})
+        return
+    core_count = len(logic.get("core_functions", [])) if isinstance(logic, dict) else 0
+    ctx.tool_statuses.append({"name": "heuristics", "status": "ok", "core_functions": core_count})
 
 
 def reverse_android(ctx: Context, kind: str) -> None:
@@ -1782,6 +1948,8 @@ def canonicalize_native_outputs(ctx: Context, output_base: str) -> None:
     move_generated_file(ctx.output_dir / f"{output_base}.disassembly.asm", ctx.output_dir / "disassembly.asm")
     move_generated_file(ctx.output_dir / f"{output_base}.enhanced.c", ctx.output_dir / "enhanced.c")
     move_generated_file(ctx.output_dir / f"{output_base}.report.md", ctx.output_dir / "report.md")
+    move_generated_file(ctx.output_dir / f"{output_base}.logic.json", ctx.output_dir / "logic.json")
+    move_generated_file(ctx.output_dir / f"{output_base}.ai_context.md", ctx.output_dir / "ai_context.md")
     move_generated_file(ctx.output_dir / f"{output_base}.summary.txt", summary_path(ctx))
 
     debug_files = {
@@ -1867,6 +2035,9 @@ def write_final_summary(ctx: Context, kind: str, existing_summary: str) -> None:
     imports = ctx.metadata.get("imports", {})
     symbols = ctx.metadata.get("symbols", {})
     strings = ctx.metadata.get("strings", {})
+    packer = ctx.metadata.get("packer", {})
+    debug_symbols = ctx.metadata.get("debug_symbols", {})
+    unpacked = ctx.metadata.get("unpacked", {})
 
     lines = [
         "DECOMPILE SUMMARY",
@@ -1891,6 +2062,24 @@ def write_final_summary(ctx: Context, kind: str, existing_summary: str) -> None:
             lines.append(f"Architecture       : {architecture['objdump']}")
         if architecture.get("format"):
             lines.append(f"Object format      : {architecture['format']}")
+
+    if isinstance(debug_symbols, dict):
+        pdb = debug_symbols.get("pdb")
+        if isinstance(pdb, dict) and pdb.get("path"):
+            lines.append(f"PDB                : {pdb['path']}")
+
+    if isinstance(packer, dict):
+        indicators = packer.get("indicators", [])
+        families = packer.get("families", [])
+        if packer.get("likely"):
+            family_text = ", ".join(families) if isinstance(families, list) and families else "unknown"
+            lines.append(f"Packer             : likely ({family_text})")
+            if isinstance(indicators, list) and indicators:
+                lines.append(f"Packer indicators  : {'; '.join(str(item) for item in indicators[:6])}")
+
+    if isinstance(unpacked, dict) and unpacked.get("path"):
+        lines.append(f"Unpacked with      : {unpacked.get('tool', 'unknown')}")
+        lines.append(f"Analyzed unpacked  : {unpacked['path']}")
 
     lines.extend(
         [
@@ -1993,9 +2182,9 @@ def print_tree(output_dir: Path, items: list[dict[str, object]]) -> None:
     print(f"{symbol('folder')} {bold(output_dir.name + '/')}")
 
     groups: list[tuple[str, list[str]]] = [
-        ("core", ["summary.txt", "metadata.json"]),
+        ("core", ["summary.txt", "metadata.json", "logic.json", "ai_context.md"]),
         ("native", ["disassembly.asm", "pseudocode.c", "enhanced.c"]),
-        ("ai", ["report.md"]),
+        ("analysis", ["report.md"]),
         ("source", ["source/", "resources/", "ios/", "app/"]),
         ("debug", ["debug/"]),
     ]
@@ -2071,7 +2260,11 @@ def open_output_dir(output_dir: Path) -> None:
 
 
 def print_outputs(ctx: Context) -> None:
-    print_completed(ctx.output_dir, ai_ran=(ctx.output_dir / "report.md").exists())
+    ai_ran = any(
+        entry.get("name") in {"enhancer", "host-enhancer"} and entry.get("status") == "ok"
+        for entry in ctx.tool_statuses
+    )
+    print_completed(ctx.output_dir, ai_ran=ai_ran)
 
 
 if __name__ == "__main__":

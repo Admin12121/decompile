@@ -2,6 +2,7 @@ include README.md
 include Dockerfile
 include decompile_tool/__init__.py
 include decompile_tool/cli.py
+include decompile_tool/heuristics.py
 include decompile_tool/DumpAllDecompile.java
 include decompile_tool/enhance_with_copilot
 recursive-include packaging *

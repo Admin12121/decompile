@@ -158,6 +158,8 @@ Important workflow:
 - Do not paste entire huge files into your reasoning.
 - Inspect the summary first, then relevant functions, strings, imports, sections, and entry/main-like logic.
 - Use objdump section dumps for hidden constants/data and packing indicators.
+- If summary mentions a PDB/debug-symbol file, use it as a naming/context signal when available.
+- If summary mentions UPX or another packer, focus on unpacked/core logic and do not reconstruct the packer stub as the main program.
 - Treat UPX/packer stubs, PLT/thunks, compiler runtime, Ghidra boilerplate, and random unreachable/noise functions as non-core unless clearly relevant.
 
 Task:
@@ -285,6 +287,7 @@ Include:
 - likely real logic vs compiler/runtime/packer noise
 - important strings, imports, sections, constants, and suspicious data
 - packing/wrapper indicators such as UPX-like sections or high entropy when visible
+- PDB/debug-symbol evidence when available
 - important functions or addresses worth reviewing
 - confidence and limitations
 
