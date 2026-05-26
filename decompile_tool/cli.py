@@ -467,8 +467,7 @@ def run_in_docker(args: list[str]) -> int:
         "-v", f"{output_dir}:/out",
     ])
 
-    if host_ai_enabled or keep_debug:
-        command.extend(["-e", "DECOMPILE_KEEP_DEBUG=1"])
+    command.extend(["-e", "DECOMPILE_KEEP_DEBUG=1"])
 
     for name in sorted(DOCKER_PASSTHROUGH_ENV):
         if name in os.environ:
@@ -493,20 +492,23 @@ def run_in_docker(args: list[str]) -> int:
         return result.returncode
 
     normalize_docker_reports(output_dir, input_path)
+    base_name = sanitize_name(input_path.name)
+    run_host_offline_heuristics(output_dir, base_name)
 
     if not host_ai_enabled:
         remove_stale_ai_outputs(output_dir)
+        cleanup_host_ai_temp(output_dir, base_name, keep_debug)
         sync_output_reports(output_dir)
         print_completed(output_dir, ai_ran=False)
         return 0
 
     if host_ai_enabled and (output_dir / "pseudocode.c").is_file():
         if confirm_ai_enhancement(output_dir):
-            result_code = run_host_ai_enhancement(input_path, output_dir, sanitize_name(input_path.name), keep_debug)
+            result_code = run_host_ai_enhancement(input_path, output_dir, base_name, keep_debug)
             print_completed(output_dir, ai_ran=result_code == 0)
             return result_code
         remove_stale_ai_outputs(output_dir)
-        cleanup_host_ai_temp(output_dir, sanitize_name(input_path.name), keep_debug=False)
+        cleanup_host_ai_temp(output_dir, base_name, keep_debug=keep_debug)
         sync_output_reports(output_dir)
         print_output_manifest_line(output_dir)
         open_output_dir(output_dir)
@@ -514,6 +516,42 @@ def run_in_docker(args: list[str]) -> int:
 
     print_completed(output_dir, ai_ran=False)
     return 0
+
+
+def run_host_offline_heuristics(output_dir: Path, base_name: str) -> None:
+    if not (output_dir / "pseudocode.c").is_file():
+        return
+    metadata = read_metadata(output_dir)
+    legacy_files = {
+        output_dir / "pseudocode.c": output_dir / f"{base_name}.pseudocode.c",
+        output_dir / "disassembly.asm": output_dir / f"{base_name}.disassembly.asm",
+        output_dir / "summary.txt": output_dir / f"{base_name}.summary.txt",
+        output_dir / "debug" / "objdump.txt": output_dir / f"{base_name}.objdump.txt",
+    }
+    objdump_err = output_dir / "debug" / "objdump.err"
+    if objdump_err.exists():
+        legacy_files[objdump_err] = output_dir / f"{base_name}.objdump.err"
+
+    for source, target in legacy_files.items():
+        if source.exists():
+            shutil.copyfile(source, target)
+
+    try:
+        status("running host offline heuristic reconstruction")
+        run_heuristic_analysis(output_dir=output_dir, base_name=base_name, metadata=metadata)
+        move_generated_file(output_dir / f"{base_name}.logic.json", output_dir / "logic.json")
+        move_generated_file(output_dir / f"{base_name}.ai_context.md", output_dir / "ai_context.md")
+        move_generated_file(output_dir / f"{base_name}.enhanced.c", output_dir / "enhanced.c")
+        move_generated_file(output_dir / f"{base_name}.report.md", output_dir / "report.md")
+    except Exception as exc:
+        status(f"offline heuristic reconstruction skipped: {compact_error(str(exc), limit=120)}")
+    finally:
+        safe_unlink(output_dir / f"{base_name}.pseudocode.c")
+        safe_unlink(output_dir / f"{base_name}.disassembly.asm")
+        safe_unlink(output_dir / f"{base_name}.summary.txt")
+        safe_unlink(output_dir / f"{base_name}.objdump.txt")
+        safe_unlink(output_dir / f"{base_name}.objdump.err")
+        sync_output_reports(output_dir)
 
 
 def parse_docker_args(args: list[str]) -> dict:
@@ -760,6 +798,17 @@ def sync_output_reports(output_dir: Path) -> None:
         refresh_metadata_outputs(output_dir)
         refresh_summary_output_section_file(output_dir)
     refresh_metadata_outputs(output_dir)
+
+
+def read_metadata(output_dir: Path) -> dict[str, object]:
+    path = output_dir / "metadata.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def refresh_metadata_outputs(output_dir: Path) -> None:
