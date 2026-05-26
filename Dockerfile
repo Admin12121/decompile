@@ -49,16 +49,13 @@ RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh &&
 ENV DECOMPILE_IN_DOCKER=1
 ENV DECOMPILE_NO_AI=1
 
-RUN mkdir -p /usr/local/share/decompile /tmp/decompile-home/.config && \
+RUN mkdir -p /tmp/decompile-home/.config && \
     chmod 0777 /tmp/decompile-home /tmp/decompile-home/.config
 
-COPY DumpAllDecompile.java /usr/local/share/decompile/DumpAllDecompile.java
-COPY enhance_with_copilot /usr/local/bin/enhance_with_copilot
 COPY decompile_tool /usr/local/bin/decompile_tool
 COPY decompile /usr/local/bin/decompile
 
 RUN chmod +x /usr/local/bin/decompile && \
-    chmod +x /usr/local/bin/enhance_with_copilot && \
     chmod +x /usr/local/bin/decompile_tool/cli.py && \
     chmod +x /usr/local/bin/decompile_tool/enhance_with_copilot
 

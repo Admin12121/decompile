@@ -1,76 +1,64 @@
-# Publishing decompile
+# Publishing
 
-This project publishes a small host CLI. The heavy reverse-engineering tools stay in the Docker image.
+The normal release path publishes the small host CLI to PyPI and AUR. The heavy reverse-engineering tools stay in the Docker image and are updated separately.
 
-## Release checklist
-
-```sh
-packaging/release.sh 0.1.1
-```
-
-The release script updates versions, builds and pushes the Docker image, pushes the GitHub tag, uploads PyPI artifacts, updates AUR, and publishes the GitHub Pages installer/apt repo.
-
-## PyPI / pip
+## PyPI + AUR
 
 ```sh
-python3 -m pip install --user --upgrade build twine
-python3 -m build
-python3 -m twine check dist/*
-python3 -m twine upload dist/*
+packaging/release.sh 0.1.4
 ```
 
-Users install it with:
+The script:
+
+1. updates version files
+2. builds and checks Python artifacts
+3. commits and tags `v0.1.4`
+4. pushes GitHub `main` and the tag
+5. uploads PyPI artifacts
+6. updates the AUR package
+
+Skip one target when needed:
 
 ```sh
-python3 -m pip install decompile
-decompile --update
-decompile ./sample
+packaging/release.sh 0.1.4 --skip-pypi
+packaging/release.sh 0.1.4 --skip-aur
 ```
 
-## AUR
+PyPI token setup:
 
 ```sh
-git clone ssh://aur@aur.archlinux.org/decompile.git /tmp/aur-decompile
-cp packaging/aur/PKGBUILD /tmp/aur-decompile/PKGBUILD
-cd /tmp/aur-decompile
-makepkg --printsrcinfo > .SRCINFO
-makepkg -si
-git add PKGBUILD .SRCINFO
-git commit -m "Initial release v0.1.3"
-git push
+export TWINE_USERNAME=__token__
+export TWINE_PASSWORD='pypi-your-token'
 ```
 
-Users install it with:
+Manual PyPI upload from an already-built `dist/`:
 
 ```sh
-yay -S decompile
-decompile --update
-decompile ./sample
+.release-venv/bin/python -m twine upload --skip-existing dist/*.whl dist/*.tar.gz
 ```
 
-## Debian .deb / simple apt repository
+Users update with:
 
-Build the package:
+```sh
+uv tool upgrade decompile
+yay -Syu decompile
+```
+
+## Debian .deb
+
+Build a local `.deb`:
 
 ```sh
 packaging/deb/build-deb.sh
 sudo apt install ./dist/decompile_0.1.3_all.deb
 ```
 
-On Arch-based development machines, install `dpkg` first if `dpkg-deb` is missing.
-
-Create a simple unsigned apt repository for testing:
+Build a simple unsigned apt repo for testing:
 
 ```sh
 packaging/deb/build-apt-repo.sh
 cd dist
 python3 -m http.server 8000
-```
-
-On a test client:
-
-```sh
-curl -fsSL http://127.0.0.1:8000/install.sh | sudo env DECOMPILE_APT_REPO_URL=http://127.0.0.1:8000/apt bash
 ```
 
 For public apt distribution, use a signed repository or a package-hosting service instead of `trusted=yes`.

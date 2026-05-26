@@ -185,6 +185,17 @@ Docker isolation reduces host writes, but it is not a malware sandbox. Do not ex
 
 ## Development
 
+Source layout:
+
+```text
+decompile                 host wrapper used by distro packages
+decompile_tool/           Python CLI plus bundled Ghidra/Copilot helpers
+packaging/aur/            AUR PKGBUILD
+packaging/deb/            optional .deb and simple apt repo helpers
+packaging/release.sh      simple PyPI + AUR release script
+Dockerfile                analysis image build
+```
+
 Build the Docker image:
 
 ```sh
@@ -201,4 +212,17 @@ Build Python release artifacts:
 
 ```sh
 python3 -m build
+```
+
+Publish PyPI and AUR:
+
+```sh
+packaging/release.sh 0.1.4
+```
+
+Publish only one target:
+
+```sh
+packaging/release.sh 0.1.4 --skip-pypi
+packaging/release.sh 0.1.4 --skip-aur
 ```

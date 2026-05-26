@@ -1,7 +1,5 @@
 include README.md
 include Dockerfile
-include DumpAllDecompile.java
-include enhance_with_copilot
 include decompile_tool/__init__.py
 include decompile_tool/cli.py
 include decompile_tool/DumpAllDecompile.java
